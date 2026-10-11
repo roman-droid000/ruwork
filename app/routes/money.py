@@ -1,0 +1,142 @@
+"""Заказы и кошелёк. Все суммы считаются на сервере по ценам из БД."""
+
+import re
+import sqlite3
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from .. import auth
+from ..db import get_db, now_ms, tx
+from ..logic import (
+    BANKS, MAX_DEP, MIN_DEP, MIN_WD, ST_CANCEL, ST_WAIT, ST_WORK,
+    add_coins, add_op, fee_of, get_coins, mk_tiers, new_id, nf, user_state,
+)
+
+router = APIRouter(prefix="/api")
+
+
+class CartItem(BaseModel):
+    id: str
+    tier: int
+
+
+class OrderIn(BaseModel):
+    items: list[CartItem]
+    method: str
+
+
+class DepositIn(BaseModel):
+    amount: float
+
+
+class WithdrawIn(BaseModel):
+    amount: float
+    phone: str
+    bank: str
+    password: str = ""
+
+
+def int_amount(x: float) -> int | None:
+    return int(x) if float(x).is_integer() else None
+
+
+@router.post("/orders")
+def create_order(body: OrderIn, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
+    if body.method not in ("sbp", "bal") or not body.items:
+        raise HTTPException(400, "Корзина пуста")
+    with tx(conn):
+        items = []
+        for it in body.items:
+            g = conn.execute("SELECT id, title, base, owner_id FROM gigs WHERE id = ?", (it.id,)).fetchone()
+            if not g or not 0 <= it.tier < 3:
+                raise HTTPException(400, "Услуга не найдена. Обновите страницу.")
+            if g["owner_id"] == user["id"]:
+                raise HTTPException(400, "Нельзя заказать собственную услугу")
+            items.append((g, it.tier, mk_tiers(g["base"])[it.tier]["rub"]))
+        total = sum(price for _, _, price in items)
+        if body.method == "bal":
+            if get_coins(conn, user["id"]) < total:
+                raise HTTPException(400, "Недостаточно монет на балансе")
+            add_coins(conn, user["id"], -total)
+        count = conn.execute("SELECT count(*) FROM orders WHERE user_id = ?", (user["id"],)).fetchone()[0]
+        ts = now_ms()
+        for k, (g, tier, price) in enumerate(items):
+            if body.method == "bal":
+                add_op(conn, user["id"], "pay", "bal", price, "done", g["title"])
+            conn.execute(
+                "INSERT INTO orders(id, user_id, num, gig_id, title, tier, status, amount, method, created_at, started_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (new_id(), user["id"], f"#RW-{1040 + count + k}", g["id"], g["title"], tier,
+                 ST_WORK if body.method == "bal" else ST_WAIT, price, body.method, ts + k,
+                 ts if body.method == "bal" else None),
+            )
+        return user_state(conn, user["id"])
+
+
+@router.post("/orders/{order_id}/cancel")
+def cancel_order(order_id: str, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
+    with tx(conn):
+        user_state(conn, user["id"])  # сначала применяем таймеры: выполненный заказ отменить нельзя
+        o = conn.execute("SELECT * FROM orders WHERE id = ? AND user_id = ?", (order_id, user["id"])).fetchone()
+        if not o or o["status"] not in (ST_WORK, ST_WAIT):
+            raise HTTPException(400, "Этот заказ нельзя отменить")
+        conn.execute("UPDATE orders SET status = ? WHERE id = ?", (ST_CANCEL, order_id))
+        if o["method"] == "bal":
+            add_coins(conn, user["id"], o["amount"])
+            add_op(conn, user["id"], "ref", "bal", o["amount"], "done", o["title"])
+        return {"refund": o["amount"] if o["method"] == "bal" else 0, **user_state(conn, user["id"])}
+
+
+@router.post("/wallet/deposit")
+def deposit(body: DepositIn, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
+    a = int_amount(body.amount)
+    if a is None or not MIN_DEP <= a <= MAX_DEP:
+        raise HTTPException(400, f"Введите целое число от {nf(MIN_DEP)} до {nf(MAX_DEP)}")
+    with tx(conn):
+        add_op(conn, user["id"], "dep", "sbp", a, "pending")
+        return user_state(conn, user["id"])
+
+
+@router.post("/wallet/withdraw")
+def withdraw(body: WithdrawIn, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
+    a = int_amount(body.amount)
+    if a is None or a < MIN_WD:
+        raise HTTPException(400, f"Минимальная сумма вывода — {nf(MIN_WD)} монет")
+    phone = re.sub(r"[\s()\-]", "", body.phone)
+    if not re.fullmatch(r"\+7\d{10}", phone):
+        raise HTTPException(400, "Введите телефон в формате +7 900 000 00 00")
+    if body.bank not in BANKS:
+        raise HTTPException(400, "Выберите банк")
+    if not body.password:
+        raise HTTPException(400, "Введите пароль")
+    if not auth.check_pw(user, body.password):
+        raise HTTPException(400, "Неверный пароль")
+    with tx(conn):
+        if a > get_coins(conn, user["id"]):
+            raise HTTPException(400, "Недостаточно монет на балансе")
+        add_coins(conn, user["id"], -a)
+        add_op(conn, user["id"], "wd", "sbp", a, "pending", f"+7 ••• •• {phone[-4:]} · {body.bank}", fee_of(a))
+        return user_state(conn, user["id"])
+
+
+@router.post("/wallet/ops/{op_id}/{act}")
+def op_action(op_id: str, act: str, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
+    # Демо-режим: в реальном сервисе зачисление и выплату подтверждает платёжный шлюз, а не пользователь.
+    with tx(conn):
+        o = conn.execute("SELECT * FROM wallet_ops WHERE id = ? AND user_id = ?", (op_id, user["id"])).fetchone()
+        if not o or o["status"] != "pending":
+            raise HTTPException(400, "Операция уже обработана")
+        if act == "credit" and o["t"] == "dep":
+            add_coins(conn, user["id"], o["coins"])
+            status = "done"
+        elif act == "finish" and o["t"] == "wd":
+            status = "done"
+        elif act == "cancel":
+            if o["t"] == "wd":
+                add_coins(conn, user["id"], o["coins"])
+            status = "cancelled"
+        else:
+            raise HTTPException(400, "Неизвестное действие")
+        conn.execute("UPDATE wallet_ops SET status = ? WHERE id = ?", (status, op_id))
+        return user_state(conn, user["id"])
