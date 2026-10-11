@@ -1,6 +1,7 @@
 """SQLite: подключение, схема и начальное заполнение каталога."""
 
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -129,6 +130,30 @@ def load_seed() -> dict:
 SEED = load_seed()
 
 
+def ensure_admin(conn: sqlite3.Connection) -> None:
+    """Создаёт аккаунт администратора, если его ещё нет. Существующий аккаунт не меняется."""
+    from . import auth
+
+    if conn.execute("SELECT 1 FROM users WHERE email = ?", (auth.ADMIN_EMAIL,)).fetchone():
+        return
+    password = os.environ.get("RUWORK_ADMIN_PASSWORD", "")
+    if not password:
+        logging.getLogger("ruwork").warning(
+            "Аккаунт администратора не создан: задайте RUWORK_ADMIN_PASSWORD при запуске"
+        )
+        return
+    if conn.execute("SELECT 1 FROM users WHERE name = ?", (auth.ADMIN_NAME,)).fetchone():
+        logging.getLogger("ruwork").warning(
+            "Аккаунт администратора не создан: имя %s занято другим аккаунтом", auth.ADMIN_NAME
+        )
+        return
+    salt, pw_hash = auth.new_password(password)
+    conn.execute(
+        "INSERT INTO users(id, name, email, salt, hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("u-admin", auth.ADMIN_NAME, auth.ADMIN_EMAIL, salt, pw_hash, now_ms()),
+    )
+
+
 def init_db() -> None:
     conn = connect()
     try:
@@ -140,7 +165,9 @@ def init_db() -> None:
                     "INSERT OR IGNORE INTO sellers(name, about, reviews_json) VALUES (?, ?, ?)",
                     (name, about, json.dumps(reviews, ensure_ascii=False)),
                 )
-            if not conn.execute("SELECT 1 FROM gigs WHERE owner_id IS NULL LIMIT 1").fetchone():
+            # Каталог заполняется один раз (отметка в user_version), чтобы удалённые админом услуги не возвращались.
+            seeded = conn.execute("PRAGMA user_version").fetchone()[0] >= 1
+            if not seeded and not conn.execute("SELECT 1 FROM gigs WHERE owner_id IS NULL LIMIT 1").fetchone():
                 ts = now_ms()
                 for g in SEED["gigs"]:
                     conn.execute(
@@ -155,5 +182,7 @@ def init_db() -> None:
                             ts,
                         ),
                     )
+            conn.execute("PRAGMA user_version = 1")
+            ensure_admin(conn)
     finally:
         conn.close()

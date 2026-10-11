@@ -15,6 +15,9 @@ SESSION_COOKIE = "ruwork_sid"
 SESSION_TTL_MS = 30 * 24 * 3600 * 1000
 PBKDF2_ITERATIONS = 150_000
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
+# Единственный аккаунт администратора. Пароль задаётся при первом запуске через RUWORK_ADMIN_PASSWORD.
+ADMIN_EMAIL = "phantom.crypta@mail.ru"
+ADMIN_NAME = "ruwork.shop"
 
 
 def b64(data: bytes) -> str:
@@ -85,5 +88,20 @@ def require_user(user: sqlite3.Row | None = Depends(optional_user)) -> sqlite3.R
     return user
 
 
+def is_admin(user: sqlite3.Row | None) -> bool:
+    return user is not None and user["email"] == ADMIN_EMAIL
+
+
+def require_admin(user: sqlite3.Row = Depends(require_user)) -> sqlite3.Row:
+    if not is_admin(user):
+        raise HTTPException(403, "Нет доступа")
+    return user
+
+
 def public_user(user: sqlite3.Row | None) -> dict | None:
-    return {"id": user["id"], "name": user["name"], "email": user["email"]} if user else None
+    if user is None:
+        return None
+    out = {"id": user["id"], "name": user["name"], "email": user["email"]}
+    if is_admin(user):
+        out["admin"] = True
+    return out

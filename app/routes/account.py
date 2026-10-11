@@ -35,7 +35,9 @@ class PasswordIn(BaseModel):
     password2: str
 
 
-def name_taken(conn: sqlite3.Connection, name: str, except_id: str = "") -> bool:
+def name_taken(conn: sqlite3.Connection, name: str, except_id: str = "", admin: bool = False) -> bool:
+    if name.lower() == auth.ADMIN_NAME and not admin:
+        return True  # имя зарезервировано за администратором, даже если его аккаунт ещё не создан
     if conn.execute("SELECT 1 FROM sellers WHERE lower(name) = lower(?)", (name,)).fetchone():
         return True
     return bool(conn.execute("SELECT 1 FROM users WHERE name = ? AND id != ?", (name, except_id)).fetchone())
@@ -57,6 +59,8 @@ def register(body: RegisterIn, response: Response, conn: sqlite3.Connection = De
         err = "Пароли не совпадают"
     elif not body.terms:
         err = "Подтвердите согласие с условиями"
+    elif email == auth.ADMIN_EMAIL:
+        err = "Этот email недоступен"
     elif conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
         err = "Аккаунт с таким email уже существует. Войдите."
     if err:
@@ -104,12 +108,12 @@ def change_name(body: NameIn, user=Depends(auth.require_user), conn: sqlite3.Con
         raise HTTPException(400, "Минимум 2 символа")
     if name == user["name"]:
         raise HTTPException(400, "Имя не изменилось")
-    if name_taken(conn, name, user["id"]):
+    if name_taken(conn, name, user["id"], auth.is_admin(user)):
         raise HTTPException(400, "Это имя занято, выберите другое")
     with tx(conn):
         conn.execute("UPDATE users SET name = ? WHERE id = ?", (name, user["id"]))
         conn.execute("UPDATE gigs SET seller = ? WHERE owner_id = ?", (name, user["id"]))
-    return {"me": {"id": user["id"], "name": name, "email": user["email"]}}
+    return {"me": auth.public_user(conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone())}
 
 
 @router.patch("/me/password")

@@ -122,21 +122,14 @@ def withdraw(body: WithdrawIn, user=Depends(auth.require_user), conn: sqlite3.Co
 
 @router.post("/wallet/ops/{op_id}/{act}")
 def op_action(op_id: str, act: str, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
-    # Демо-режим: в реальном сервисе зачисление и выплату подтверждает платёжный шлюз, а не пользователь.
+    """Пользователь может только отменить свою заявку; одобряет её администратор (app/routes/admin.py)."""
+    if act != "cancel":
+        raise HTTPException(400, "Заявку подтверждает администратор")
     with tx(conn):
         o = conn.execute("SELECT * FROM wallet_ops WHERE id = ? AND user_id = ?", (op_id, user["id"])).fetchone()
         if not o or o["status"] != "pending":
             raise HTTPException(400, "Операция уже обработана")
-        if act == "credit" and o["t"] == "dep":
+        if o["t"] == "wd":
             add_coins(conn, user["id"], o["coins"])
-            status = "done"
-        elif act == "finish" and o["t"] == "wd":
-            status = "done"
-        elif act == "cancel":
-            if o["t"] == "wd":
-                add_coins(conn, user["id"], o["coins"])
-            status = "cancelled"
-        else:
-            raise HTTPException(400, "Неизвестное действие")
-        conn.execute("UPDATE wallet_ops SET status = ? WHERE id = ?", (status, op_id))
+        conn.execute("UPDATE wallet_ops SET status = 'cancelled' WHERE id = ?", (op_id,))
         return user_state(conn, user["id"])
