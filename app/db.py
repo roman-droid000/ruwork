@@ -168,6 +168,9 @@ def init_db() -> None:
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        # Миграция: время последней активности пользователя (для списка «Онлайн» в админ-панели).
+        if "last_seen" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN last_seen INTEGER")
         with tx(conn):
             for name, (about, reviews) in SEED["sellers"].items():
                 conn.execute(

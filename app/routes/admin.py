@@ -5,7 +5,7 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException
 
 from .. import auth
-from ..db import get_db, tx
+from ..db import get_db, now_ms, tx
 from ..logic import add_coins, gig_out
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(auth.require_admin)])
@@ -67,6 +67,22 @@ def reset_decide(reset_id: str, act: str, conn: sqlite3.Connection = Depends(get
         conn.execute("UPDATE password_resets SET status = ? WHERE id = ?",
                      ("done" if act == "approve" else "cancelled", reset_id))
     return resets(conn)
+
+
+@router.get("/users")
+def users(conn: sqlite3.Connection = Depends(get_db)):
+    rows = conn.execute(
+        "SELECT u.id, u.name, u.email, u.created_at, u.last_seen,"
+        " COALESCE((SELECT coins FROM wallets w WHERE w.user_id = u.id), 0) AS coins,"
+        " (SELECT count(*) FROM orders o WHERE o.user_id = u.id) AS orders,"
+        " (SELECT count(*) FROM gigs g WHERE g.owner_id = u.id) AS gigs"
+        " FROM users u ORDER BY u.created_at DESC"
+    ).fetchall()
+    since = now_ms() - auth.ONLINE_MS
+    return [
+        {**dict(r), "online": (r["last_seen"] or 0) >= since, "admin": r["email"] == auth.ADMIN_EMAIL}
+        for r in rows
+    ]
 
 
 @router.get("/gigs")

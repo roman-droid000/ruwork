@@ -128,6 +128,12 @@ def logout(request: Request, response: Response, conn: sqlite3.Connection = Depe
     return {"ok": True}
 
 
+@router.get("/ping")
+def ping(user=Depends(auth.optional_user)):
+    """Пульс открытой вкладки: optional_user обновляет last_seen, по нему строится список «Онлайн»."""
+    return {"ok": True}
+
+
 @router.get("/state")
 def state(user=Depends(auth.optional_user), conn: sqlite3.Connection = Depends(get_db)):
     if user is None:

@@ -13,6 +13,8 @@ from .db import get_db, now_ms
 
 SESSION_COOKIE = "ruwork_sid"
 SESSION_TTL_MS = 30 * 24 * 3600 * 1000
+ONLINE_MS = 2 * 60 * 1000  # пользователь «онлайн», если был активен за последние 2 минуты
+SEEN_THROTTLE_MS = 30 * 1000  # last_seen пишем не чаще раза в 30 секунд
 PBKDF2_ITERATIONS = 150_000
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
 # Единственный аккаунт администратора. Пароль задаётся при первом запуске через RUWORK_ADMIN_PASSWORD.
@@ -76,10 +78,13 @@ def optional_user(request: Request, conn: sqlite3.Connection = Depends(get_db)) 
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         return None
-    return conn.execute(
+    user = conn.execute(
         "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.created_at > ?",
         (token, now_ms() - SESSION_TTL_MS),
     ).fetchone()
+    if user is not None and (user["last_seen"] or 0) < now_ms() - SEEN_THROTTLE_MS and not conn.in_transaction:
+        conn.execute("UPDATE users SET last_seen = ? WHERE id = ?", (now_ms(), user["id"]))
+    return user
 
 
 def require_user(user: sqlite3.Row | None = Depends(optional_user)) -> sqlite3.Row:
