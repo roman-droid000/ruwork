@@ -25,6 +25,13 @@ class LoginIn(BaseModel):
     password: str
 
 
+class ResetIn(BaseModel):
+    email: str
+    password: str
+    password2: str
+    contact: str
+
+
 class NameIn(BaseModel):
     name: str
 
@@ -86,6 +93,33 @@ def login(body: LoginIn, response: Response, conn: sqlite3.Connection = Depends(
         raise HTTPException(400, "Неверный email или пароль")
     auth.start_session(conn, response, user["id"])
     return {"me": auth.public_user(user)}
+
+
+@router.post("/auth/reset")
+def request_reset(body: ResetIn, conn: sqlite3.Connection = Depends(get_db)):
+    """Заявка на сброс пароля. Новый пароль вступает в силу после одобрения администратором."""
+    contact = esc(body.contact.strip())[:100]
+    if not auth.EMAIL_RE.match(body.email.strip()) or len(body.email) > 120:
+        raise HTTPException(400, "Введите корректный email")
+    if auth.password_error(body.password) or len(body.password) > 100:
+        raise HTTPException(400, "Новый пароль: минимум 8 символов, буквы и цифры")
+    if body.password != body.password2:
+        raise HTTPException(400, "Пароли не совпадают")
+    if len(contact) < 3:
+        raise HTTPException(400, "Укажите контакт для связи: Telegram или телефон")
+    salt, pw_hash = auth.new_password(body.password)  # считаем всегда, чтобы время ответа не выдавало наличие аккаунта
+    user = conn.execute("SELECT * FROM users WHERE email = ?", (auth.norm_email(body.email),)).fetchone()
+    # Ответ одинаковый, есть аккаунт или нет, чтобы по форме нельзя было проверить, зарегистрирован ли email.
+    # Пароль администратора через заявку не сбрасывается: он меняется только в профиле.
+    if user is not None and not auth.is_admin(user):
+        with tx(conn):
+            conn.execute("DELETE FROM password_resets WHERE user_id = ? AND status = 'pending'", (user["id"],))
+            conn.execute(
+                "INSERT INTO password_resets(id, user_id, contact, salt, hash, status, ts)"
+                " VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+                (new_id("pr"), user["id"], contact, salt, pw_hash, now_ms()),
+            )
+    return {"ok": True}
 
 
 @router.post("/auth/logout")

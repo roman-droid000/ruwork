@@ -87,6 +87,15 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     ts     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chat_owner_gig ON chat_messages(owner, gig_id, id);
+CREATE TABLE IF NOT EXISTS password_resets (
+    id      TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    contact TEXT NOT NULL,
+    salt    TEXT NOT NULL,
+    hash    TEXT NOT NULL,
+    status  TEXT NOT NULL,
+    ts      INTEGER NOT NULL
+);
 """
 
 

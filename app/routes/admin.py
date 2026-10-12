@@ -40,6 +40,35 @@ def op_decide(op_id: str, act: str, conn: sqlite3.Connection = Depends(get_db)):
     return ops(conn)
 
 
+RESETS_SQL = (
+    "SELECT r.id, r.contact, r.status, r.ts, u.name, u.email"
+    " FROM password_resets r JOIN users u ON u.id = r.user_id"
+)
+
+
+@router.get("/resets")
+def resets(conn: sqlite3.Connection = Depends(get_db)):
+    pending = conn.execute(RESETS_SQL + " WHERE r.status = 'pending' ORDER BY r.ts").fetchall()
+    done = conn.execute(RESETS_SQL + " WHERE r.status != 'pending' ORDER BY r.ts DESC LIMIT 50").fetchall()
+    return [dict(r) for r in pending + done]
+
+
+@router.post("/resets/{reset_id}/{act}")
+def reset_decide(reset_id: str, act: str, conn: sqlite3.Connection = Depends(get_db)):
+    if act not in ("approve", "reject"):
+        raise HTTPException(400, "Неизвестное действие")
+    with tx(conn):
+        r = conn.execute("SELECT * FROM password_resets WHERE id = ?", (reset_id,)).fetchone()
+        if not r or r["status"] != "pending":
+            raise HTTPException(400, "Заявка уже обработана")
+        if act == "approve":
+            conn.execute("UPDATE users SET salt = ?, hash = ? WHERE id = ?", (r["salt"], r["hash"], r["user_id"]))
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (r["user_id"],))  # выход на всех устройствах
+        conn.execute("UPDATE password_resets SET status = ? WHERE id = ?",
+                     ("done" if act == "approve" else "cancelled", reset_id))
+    return resets(conn)
+
+
 @router.get("/gigs")
 def gigs(conn: sqlite3.Connection = Depends(get_db)):
     rows = conn.execute(
