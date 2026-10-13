@@ -33,7 +33,11 @@ def meta(conn: sqlite3.Connection = Depends(get_db)):
 
 @router.get("/gigs")
 def gigs(conn: sqlite3.Connection = Depends(get_db)):
-    rows = conn.execute("SELECT * FROM gigs ORDER BY owner_id IS NOT NULL, created_at, id").fetchall()
+    # Объявления заблокированных пользователей скрыты из каталога до разблокировки.
+    rows = conn.execute(
+        "SELECT g.* FROM gigs g LEFT JOIN users u ON u.id = g.owner_id WHERE u.blocked_at IS NULL"
+        " ORDER BY g.owner_id IS NOT NULL, g.created_at, g.id"
+    ).fetchall()
     return [gig_out(r) for r in rows]
 
 

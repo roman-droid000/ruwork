@@ -74,19 +74,39 @@ def gig_out(row: sqlite3.Row) -> dict:
 def tick(conn: sqlite3.Connection, user_id: str) -> None:
     """Продвигает заказы по таймерам. Вызывается перед каждым чтением состояния."""
     n = now_ms()
+    # Заказы, где пользователь покупатель или продавец: у продавца в «Продажах» статусы тоже актуальны.
     conn.execute(
-        "UPDATE orders SET status = ?, started_at = created_at + ? WHERE user_id = ? AND status = ? AND ? - created_at >= ?",
-        (ST_WORK, CONFIRM_MS, user_id, ST_WAIT, n, CONFIRM_MS),
+        "UPDATE orders SET status = ?, started_at = created_at + ? WHERE (user_id = ? OR seller_id = ?)"
+        " AND status = ? AND ? - created_at >= ?",
+        (ST_WORK, CONFIRM_MS, user_id, user_id, ST_WAIT, n, CONFIRM_MS),
     )
     conn.execute(
-        "UPDATE orders SET status = ? WHERE user_id = ? AND status = ? AND started_at IS NOT NULL AND ? - started_at >= ?",
-        (ST_DONE, user_id, ST_WORK, n, WORK_MS),
+        "UPDATE orders SET status = ? WHERE (user_id = ? OR seller_id = ?) AND status = ?"
+        " AND started_at IS NOT NULL AND ? - started_at >= ?",
+        (ST_DONE, user_id, user_id, ST_WORK, n, WORK_MS),
     )
 
 
 def order_row(r: sqlite3.Row) -> list:
     # Формат строки, который ожидает dash() на фронтенде.
-    return [r["num"], r["title"], r["status"], r["amount"], r["method"], r["id"], r["created_at"], r["started_at"]]
+    return [r["num"], r["title"], r["status"], r["amount"], r["method"], r["id"], r["created_at"], r["started_at"],
+            r["gig_id"]]
+
+
+def sales(conn: sqlite3.Connection, user_id: str) -> list[dict]:
+    """Заказы по объявлениям пользователя (он продавец). seen=False — уведомление о покупке ещё не показано."""
+    rows = conn.execute(
+        "SELECT o.id, o.num, o.gig_id, o.title, o.tier, o.status, o.amount, o.created_at, o.seller_seen,"
+        " o.user_id AS buyer, u.name AS buyer_name FROM orders o JOIN users u ON u.id = o.user_id"
+        " WHERE o.seller_id = ? ORDER BY o.created_at DESC, o.rowid DESC LIMIT 200",
+        (user_id,),
+    ).fetchall()
+    return [
+        {"id": r["id"], "num": r["num"], "gig": r["gig_id"], "title": r["title"], "tier": TIERS[r["tier"]][0],
+         "status": r["status"], "amount": r["amount"], "ts": r["created_at"], "seen": bool(r["seller_seen"]),
+         "buyer": r["buyer"], "buyer_name": r["buyer_name"]}
+        for r in rows
+    ]
 
 
 def get_coins(conn: sqlite3.Connection, user_id: str) -> int:
@@ -117,9 +137,19 @@ def user_state(conn: sqlite3.Connection, user_id: str) -> dict:
         "SELECT id, t, method, coins, fee, status, dest, ts FROM wallet_ops WHERE user_id = ? ORDER BY ts DESC, rowid DESC",
         (user_id,),
     ).fetchall()
+    # Диалоги по своим объявлениям, где последнее сообщение от покупателя (ждут ответа продавца).
+    inbox = conn.execute(
+        "SELECT m.gig_id, count(*) FROM chat_messages m JOIN ("
+        " SELECT max(id) AS mid FROM chat_messages"
+        " WHERE gig_id IN (SELECT id FROM gigs WHERE owner_id = ?) GROUP BY owner, gig_id"
+        ") t ON m.id = t.mid WHERE m.role IN ('me', 'order') GROUP BY m.gig_id",
+        (user_id,),
+    ).fetchall()
     return {
         "orders": [order_row(o) for o in orders],
         "wallet": {"coins": get_coins(conn, user_id), "ops": [dict(o) for o in ops]},
+        "inbox": {r[0]: r[1] for r in inbox},
+        "sales": sales(conn, user_id),
     }
 
 
@@ -153,7 +183,8 @@ def ai_prompt(g: dict, seller_about: str, history: list[tuple[str, str]]) -> str
     d = g["details"]
     extra = f" {d[0]} Результат: {'; '.join(d[1])}. От клиента нужно: {d[2]}" if d else ""
     tiers = "; ".join(f"{t['name']} — {rub(t['rub'])}, {t['days']} дн., правок: {t['revs']}" for t in g["tiers"])
-    dialog = "\n".join(("Клиент: " if r == "me" else "Продавец: ") + t for r, t in history[-10:])
+    who = {"me": "Клиент: ", "order": "Платформа: "}
+    dialog = "\n".join(who.get(r, "Продавец: ") + t for r, t in history[-10:])
     return (
         f"Ты — ИИ-ответчик продавца «{g['seller']}» на маркетплейсе RUWORK. Отвечай по-русски, дружелюбно и коротко "
         "(до 3 предложений), только по данным ниже, ничего не выдумывай. Не подтверждай заказ и оплату и не обещай "

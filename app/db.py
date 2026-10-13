@@ -169,8 +169,20 @@ def init_db() -> None:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
         # Миграция: время последней активности пользователя (для списка «Онлайн» в админ-панели).
-        if "last_seen" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+        if "last_seen" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN last_seen INTEGER")
+        # Миграция: блокировка пользователя администратором (время блокировки и причина).
+        if "blocked_at" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN blocked_at INTEGER")
+            conn.execute("ALTER TABLE users ADD COLUMN block_reason TEXT NOT NULL DEFAULT ''")
+        # Миграция: продавец заказа (автор объявления) и отметка, что он видел уведомление о покупке.
+        ocols = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
+        if "seller_id" not in ocols:
+            conn.execute("ALTER TABLE orders ADD COLUMN seller_id TEXT")
+            conn.execute("ALTER TABLE orders ADD COLUMN seller_seen INTEGER NOT NULL DEFAULT 1")
+            conn.execute("UPDATE orders SET seller_id = (SELECT owner_id FROM gigs WHERE gigs.id = orders.gig_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS orders_seller ON orders(seller_id, created_at)")
         with tx(conn):
             for name, (about, reviews) in SEED["sellers"].items():
                 conn.execute(

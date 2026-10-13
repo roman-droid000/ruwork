@@ -3,12 +3,17 @@
 import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from .. import auth
 from ..db import get_db, now_ms, tx
 from ..logic import add_coins, gig_out
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(auth.require_admin)])
+
+
+class BlockIn(BaseModel):
+    reason: str = ""
 
 OPS_SQL = (
     "SELECT o.id, o.t, o.coins, o.fee, o.status, o.dest, o.ts, u.name, u.email"
@@ -72,7 +77,7 @@ def reset_decide(reset_id: str, act: str, conn: sqlite3.Connection = Depends(get
 @router.get("/users")
 def users(conn: sqlite3.Connection = Depends(get_db)):
     rows = conn.execute(
-        "SELECT u.id, u.name, u.email, u.created_at, u.last_seen,"
+        "SELECT u.id, u.name, u.email, u.created_at, u.last_seen, u.blocked_at, u.block_reason,"
         " COALESCE((SELECT coins FROM wallets w WHERE w.user_id = u.id), 0) AS coins,"
         " (SELECT count(*) FROM orders o WHERE o.user_id = u.id) AS orders,"
         " (SELECT count(*) FROM gigs g WHERE g.owner_id = u.id) AS gigs"
@@ -80,18 +85,41 @@ def users(conn: sqlite3.Connection = Depends(get_db)):
     ).fetchall()
     since = now_ms() - auth.ONLINE_MS
     return [
-        {**dict(r), "online": (r["last_seen"] or 0) >= since, "admin": r["email"] == auth.ADMIN_EMAIL}
+        {**dict(r), "online": r["blocked_at"] is None and (r["last_seen"] or 0) >= since,
+         "admin": r["email"] == auth.ADMIN_EMAIL}
         for r in rows
     ]
+
+
+@router.post("/users/{user_id}/block")
+def block_user(user_id: str, body: BlockIn, conn: sqlite3.Connection = Depends(get_db)):
+    with tx(conn):
+        u = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not u:
+            raise HTTPException(404, "Пользователь не найден")
+        if auth.is_admin(u):
+            raise HTTPException(400, "Нельзя заблокировать администратора")
+        conn.execute("UPDATE users SET blocked_at = ?, block_reason = ? WHERE id = ?",
+                     (now_ms(), body.reason.strip()[:200], user_id))
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))  # выход на всех устройствах
+    return users(conn)
+
+
+@router.post("/users/{user_id}/unblock")
+def unblock_user(user_id: str, conn: sqlite3.Connection = Depends(get_db)):
+    if not conn.execute("UPDATE users SET blocked_at = NULL, block_reason = '' WHERE id = ?", (user_id,)).rowcount:
+        raise HTTPException(404, "Пользователь не найден")
+    return users(conn)
 
 
 @router.get("/gigs")
 def gigs(conn: sqlite3.Connection = Depends(get_db)):
     rows = conn.execute(
-        "SELECT g.*, u.email AS owner_email FROM gigs g LEFT JOIN users u ON u.id = g.owner_id"
+        "SELECT g.*, u.email AS owner_email, u.blocked_at IS NOT NULL AS owner_blocked"
+        " FROM gigs g LEFT JOIN users u ON u.id = g.owner_id"
         " ORDER BY g.owner_id IS NULL, g.created_at DESC, g.id"
     ).fetchall()
-    return [{**gig_out(r), "owner_email": r["owner_email"]} for r in rows]
+    return [{**gig_out(r), "owner_email": r["owner_email"], "owner_blocked": bool(r["owner_blocked"])} for r in rows]
 
 
 @router.delete("/gigs/{gig_id}")

@@ -9,8 +9,8 @@ from pydantic import BaseModel
 from .. import auth
 from ..db import get_db, now_ms, tx
 from ..logic import (
-    BANKS, MAX_DEP, MIN_DEP, MIN_WD, ST_CANCEL, ST_WAIT, ST_WORK,
-    add_coins, add_op, fee_of, get_coins, mk_tiers, new_id, nf, user_state,
+    BANKS, MAX_DEP, MIN_DEP, MIN_WD, ST_CANCEL, ST_WAIT, ST_WORK, TIERS,
+    add_coins, add_op, fee_of, get_coins, mk_tiers, new_id, nf, rub, user_state,
 )
 
 router = APIRouter(prefix="/api")
@@ -48,7 +48,11 @@ def create_order(body: OrderIn, user=Depends(auth.require_user), conn: sqlite3.C
     with tx(conn):
         items = []
         for it in body.items:
-            g = conn.execute("SELECT id, title, base, owner_id FROM gigs WHERE id = ?", (it.id,)).fetchone()
+            g = conn.execute(
+                "SELECT g.id, g.title, g.base, g.owner_id FROM gigs g LEFT JOIN users u ON u.id = g.owner_id"
+                " WHERE g.id = ? AND u.blocked_at IS NULL",
+                (it.id,),
+            ).fetchone()
             if not g or not 0 <= it.tier < 3:
                 raise HTTPException(400, "Услуга не найдена. Обновите страницу.")
             if g["owner_id"] == user["id"]:
@@ -64,12 +68,20 @@ def create_order(body: OrderIn, user=Depends(auth.require_user), conn: sqlite3.C
         for k, (g, tier, price) in enumerate(items):
             if body.method == "bal":
                 add_op(conn, user["id"], "pay", "bal", price, "done", g["title"])
+            num = f"#RW-{1040 + count + k}"
             conn.execute(
-                "INSERT INTO orders(id, user_id, num, gig_id, title, tier, status, amount, method, created_at, started_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (new_id(), user["id"], f"#RW-{1040 + count + k}", g["id"], g["title"], tier,
+                "INSERT INTO orders(id, user_id, num, gig_id, title, tier, status, amount, method, created_at, started_at,"
+                " seller_id, seller_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (new_id(), user["id"], num, g["id"], g["title"], tier,
                  ST_WORK if body.method == "bal" else ST_WAIT, price, body.method, ts + k,
-                 ts if body.method == "bal" else None),
+                 ts if body.method == "bal" else None, g["owner_id"], 0 if g["owner_id"] else 1),
+            )
+            # Заказ открывает диалог покупателя с продавцом: продавец видит его в «Сообщениях покупателей».
+            conn.execute(
+                "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'order', ?, ?)",
+                ("u:" + user["id"], g["id"],
+                 f"Оформлен заказ {num}: тариф «{TIERS[tier][0]}», {rub(price)}"
+                 + (", оплачен с баланса" if body.method == "bal" else ", оплата через СБП"), ts + k),
             )
         return user_state(conn, user["id"])
 
@@ -82,10 +94,21 @@ def cancel_order(order_id: str, user=Depends(auth.require_user), conn: sqlite3.C
         if not o or o["status"] not in (ST_WORK, ST_WAIT):
             raise HTTPException(400, "Этот заказ нельзя отменить")
         conn.execute("UPDATE orders SET status = ? WHERE id = ?", (ST_CANCEL, order_id))
+        conn.execute(
+            "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'order', ?, ?)",
+            ("u:" + user["id"], o["gig_id"], f"Покупатель отменил заказ {o['num']}", now_ms()),
+        )
         if o["method"] == "bal":
             add_coins(conn, user["id"], o["amount"])
             add_op(conn, user["id"], "ref", "bal", o["amount"], "done", o["title"])
         return {"refund": o["amount"] if o["method"] == "bal" else 0, **user_state(conn, user["id"])}
+
+
+@router.post("/sales/seen")
+def sales_seen(user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
+    """Продавец увидел уведомления о новых покупках."""
+    conn.execute("UPDATE orders SET seller_seen = 1 WHERE seller_id = ? AND seller_seen = 0", (user["id"],))
+    return {"ok": True}
 
 
 @router.post("/wallet/deposit")

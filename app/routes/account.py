@@ -91,6 +91,8 @@ def login(body: LoginIn, response: Response, conn: sqlite3.Connection = Depends(
     user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
     if not user or not auth.check_pw(user, body.password):
         raise HTTPException(400, "Неверный email или пароль")
+    if user["blocked_at"] is not None:
+        raise HTTPException(403, auth.blocked_message(user))
     auth.start_session(conn, response, user["id"])
     return {"me": auth.public_user(user)}
 
@@ -111,7 +113,7 @@ def request_reset(body: ResetIn, conn: sqlite3.Connection = Depends(get_db)):
     user = conn.execute("SELECT * FROM users WHERE email = ?", (auth.norm_email(body.email),)).fetchone()
     # Ответ одинаковый, есть аккаунт или нет, чтобы по форме нельзя было проверить, зарегистрирован ли email.
     # Пароль администратора через заявку не сбрасывается: он меняется только в профиле.
-    if user is not None and not auth.is_admin(user):
+    if user is not None and not auth.is_admin(user) and user["blocked_at"] is None:
         with tx(conn):
             conn.execute("DELETE FROM password_resets WHERE user_id = ? AND status = 'pending'", (user["id"],))
             conn.execute(
@@ -129,9 +131,14 @@ def logout(request: Request, response: Response, conn: sqlite3.Connection = Depe
 
 
 @router.get("/ping")
-def ping(user=Depends(auth.optional_user)):
-    """Пульс открытой вкладки: optional_user обновляет last_seen, по нему строится список «Онлайн»."""
-    return {"ok": True}
+def ping(user=Depends(auth.optional_user), conn: sqlite3.Connection = Depends(get_db)):
+    """Пульс открытой вкладки: optional_user обновляет last_seen, по нему строится список «Онлайн».
+    auth=false сообщает странице, что сессия завершена (например, пользователя заблокировали).
+    new_sales — сколько покупок у продавца ещё без уведомления."""
+    if user is None:
+        return {"ok": True, "auth": False, "new_sales": 0}
+    n = conn.execute("SELECT count(*) FROM orders WHERE seller_id = ? AND seller_seen = 0", (user["id"],)).fetchone()[0]
+    return {"ok": True, "auth": True, "new_sales": n}
 
 
 @router.get("/state")

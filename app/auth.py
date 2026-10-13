@@ -79,12 +79,18 @@ def optional_user(request: Request, conn: sqlite3.Connection = Depends(get_db)) 
     if not token:
         return None
     user = conn.execute(
-        "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.created_at > ?",
+        "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id"
+        " WHERE s.token = ? AND s.created_at > ? AND u.blocked_at IS NULL",
         (token, now_ms() - SESSION_TTL_MS),
     ).fetchone()
     if user is not None and (user["last_seen"] or 0) < now_ms() - SEEN_THROTTLE_MS and not conn.in_transaction:
         conn.execute("UPDATE users SET last_seen = ? WHERE id = ?", (now_ms(), user["id"]))
     return user
+
+
+def blocked_message(user: sqlite3.Row) -> str:
+    reason = user["block_reason"]
+    return "Аккаунт заблокирован администратором" + (f". Причина: {reason}" if reason else "")
 
 
 def require_user(user: sqlite3.Row | None = Depends(optional_user)) -> sqlite3.Row:
