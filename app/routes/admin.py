@@ -7,7 +7,8 @@ from pydantic import BaseModel
 
 from .. import auth
 from ..db import get_db, now_ms, tx
-from ..logic import add_coins, gig_out
+from ..logic import TIERS, add_coins, gig_out, platform_add
+from .orders import remove_cover
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(auth.require_admin)])
 
@@ -38,11 +39,25 @@ def op_decide(op_id: str, act: str, conn: sqlite3.Connection = Depends(get_db)):
             raise HTTPException(400, "Заявка уже обработана")
         if act == "approve" and o["t"] == "dep":
             add_coins(conn, o["user_id"], o["coins"])
+        elif act == "approve" and o["t"] == "wd":
+            platform_add(conn, "wd_fee", o["fee"], o["user_id"], None, o["dest"])  # комиссия за вывод
         elif act == "reject" and o["t"] == "wd":
             add_coins(conn, o["user_id"], o["coins"])  # монеты были удержаны при создании заявки
         status = "done" if act == "approve" else "cancelled"
         conn.execute("UPDATE wallet_ops SET status = ? WHERE id = ?", (status, op_id))
     return ops(conn)
+
+
+@router.get("/platform")
+def platform(conn: sqlite3.Connection = Depends(get_db)):
+    """Баланс платформы: комиссии за вывод и доля удержания при отмене заказов «В работе»."""
+    by = {r["kind"]: r["s"] for r in conn.execute("SELECT kind, sum(coins) AS s FROM platform_ops GROUP BY kind")}
+    ops = conn.execute(
+        "SELECT p.kind, p.coins, p.note, p.ts, u.name FROM platform_ops p LEFT JOIN users u ON u.id = p.user_id"
+        " ORDER BY p.id DESC LIMIT 30"
+    ).fetchall()
+    return {"coins": sum(by.values()), "wd_fee": by.get("wd_fee", 0), "cancel": by.get("cancel", 0),
+            "ops": [dict(r) for r in ops]}
 
 
 RESETS_SQL = (
@@ -91,6 +106,31 @@ def users(conn: sqlite3.Connection = Depends(get_db)):
     ]
 
 
+DEALS_SQL = (
+    "SELECT o.id, o.num, o.gig_id, o.title, o.tier, o.status, o.amount, o.method, o.created_at,"
+    " (SELECT count(*) FROM order_files f WHERE f.order_id = o.id AND f.done = 1) AS files,"
+    " b.name AS buyer_name, s.name AS seller_name FROM orders o JOIN users b ON b.id = o.user_id"
+    " LEFT JOIN users s ON s.id = o.seller_id"
+)
+
+
+def deal(r: sqlite3.Row) -> dict:
+    return {**dict(r), "tier": TIERS[r["tier"]][0]}
+
+
+@router.get("/users/{user_id}")
+def user_profile(user_id: str, conn: sqlite3.Connection = Depends(get_db)):
+    """Профиль для проверки: сделки пользователя как продавца и как покупателя, его объявления."""
+    u = next((x for x in users(conn) if x["id"] == user_id), None)
+    if not u:
+        raise HTTPException(404, "Пользователь не найден")
+    sales = conn.execute(DEALS_SQL + " WHERE o.seller_id = ? ORDER BY o.created_at DESC LIMIT 200", (user_id,))
+    buys = conn.execute(DEALS_SQL + " WHERE o.user_id = ? ORDER BY o.created_at DESC LIMIT 200", (user_id,))
+    gigs = conn.execute("SELECT * FROM gigs WHERE owner_id = ? ORDER BY created_at DESC", (user_id,))
+    return {"user": u, "sales": [deal(r) for r in sales], "purchases": [deal(r) for r in buys],
+            "gigs": [gig_out(r) for r in gigs]}
+
+
 @router.post("/users/{user_id}/block")
 def block_user(user_id: str, body: BlockIn, conn: sqlite3.Connection = Depends(get_db)):
     with tx(conn):
@@ -125,7 +165,10 @@ def gigs(conn: sqlite3.Connection = Depends(get_db)):
 @router.delete("/gigs/{gig_id}")
 def delete_gig(gig_id: str, conn: sqlite3.Connection = Depends(get_db)):
     with tx(conn):
-        if not conn.execute("DELETE FROM gigs WHERE id = ?", (gig_id,)).rowcount:
+        g = conn.execute("SELECT cover FROM gigs WHERE id = ?", (gig_id,)).fetchone()
+        if not g:
             raise HTTPException(404, "Объявление не найдено")
+        conn.execute("DELETE FROM gigs WHERE id = ?", (gig_id,))
         conn.execute("DELETE FROM chat_messages WHERE gig_id = ?", (gig_id,))
+    remove_cover(g["cover"])
     return {"ok": True}

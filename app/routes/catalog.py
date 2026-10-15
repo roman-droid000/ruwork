@@ -8,7 +8,8 @@ from pydantic import BaseModel
 
 from .. import auth
 from ..db import SEED, get_db, now_ms
-from ..logic import CATS, MINP, SUBS, esc, gig_out, rub
+from ..logic import CATS, MINP, SBP_ORDERS, SUBS, esc, gig_out, rub
+from .orders import remove_cover
 
 router = APIRouter(prefix="/api")
 
@@ -28,7 +29,8 @@ def meta(conn: sqlite3.Connection = Depends(get_db)):
         r["name"]: [r["about"], json.loads(r["reviews_json"])]
         for r in conn.execute("SELECT * FROM sellers")
     }
-    return {"cats": SEED["cats"], "subs": SUBS, "minp": MINP, "syn": SEED["syn"], "sellers": sellers}
+    return {"cats": SEED["cats"], "subs": SUBS, "minp": MINP, "syn": SEED["syn"], "sellers": sellers,
+            "sbp_orders": SBP_ORDERS}
 
 
 @router.get("/gigs")
@@ -64,7 +66,9 @@ def create_gig(body: GigIn, user=Depends(auth.require_user), conn: sqlite3.Conne
 
 @router.delete("/gigs/{gig_id}")
 def delete_gig(gig_id: str, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
-    cur = conn.execute("DELETE FROM gigs WHERE id = ? AND owner_id = ?", (gig_id, user["id"]))
-    if not cur.rowcount:
+    g = conn.execute("SELECT cover FROM gigs WHERE id = ? AND owner_id = ?", (gig_id, user["id"])).fetchone()
+    if not g:
         raise HTTPException(404, "Объявление не найдено")
+    conn.execute("DELETE FROM gigs WHERE id = ?", (gig_id,))
+    remove_cover(g["cover"])
     return {"ok": True}

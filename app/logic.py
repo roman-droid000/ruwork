@@ -12,6 +12,10 @@ from .db import SEED, now_ms
 RATE = 250  # рублей за 1 TON
 CONFIRM_MS = 60_000  # «Ожидает подтверждения» → «В работе»
 WORK_MS = 86_400_000  # «В работе» → «Выполнен»
+SBP_ORDERS = False  # оплата заказов через СБП временно отключена; True — включить обратно
+REFUND_WORK_PCT = 90  # возврат при отмене заказа «В работе»; до подтверждения возвращается 100 %
+PLATFORM_CANCEL_PCT = 5  # из удержанных 10 % платформе; остальное — продавцу за начатую работу
+AUTO_CONFIRM_MS = 7 * 86_400_000  # заказ «На проверке» подтверждается сам через 7 дней
 MIN_DEP, MAX_DEP = 100, 100_000
 MIN_WD, WD_FEE, WD_MIN_FEE = 500, 0.02, 10
 BANKS = ["Сбербанк", "Т-Банк", "ВТБ", "Альфа-Банк", "Другой банк"]
@@ -21,6 +25,7 @@ SUBS: dict[str, list[str]] = SEED["subs"]
 MINP: dict[str, int] = SEED["minp"]
 
 ST_WAIT, ST_WORK, ST_DONE, ST_CANCEL = "Ожидает подтверждения", "В работе", "Выполнен", "Отменён"
+ST_REVIEW = "На проверке"  # продавец загрузил результат, ждём подтверждения покупателя
 
 TIERS = [
     ("Эконом", 1, 3, 1, ["1 вариант работы"]),
@@ -62,7 +67,7 @@ def gig_out(row: sqlite3.Row) -> dict:
         "id": row["id"], "cat": row["cat"], "sub": row["sub"], "title": row["title"], "base": row["base"],
         "rating": row["rating"], "rev": row["rev"], "seller": row["seller"], "lvl": row["lvl"],
         "desc": row["descr"], "top": bool(row["top"]), "tags": json.loads(row["tags_json"]),
-        "tiers": mk_tiers(row["base"]),
+        "tiers": mk_tiers(row["base"]), "cover": row["cover"],
         "details": json.loads(row["details_json"]) if row["details_json"] else None,
     }
     if row["owner_id"]:
@@ -72,7 +77,9 @@ def gig_out(row: sqlite3.Row) -> dict:
 
 
 def tick(conn: sqlite3.Connection, user_id: str) -> None:
-    """Продвигает заказы по таймерам. Вызывается перед каждым чтением состояния."""
+    """Продвигает заказы по таймерам. Вызывается перед каждым чтением состояния.
+    «Выполнен» по таймеру ставится только услугам каталога RUWORK: заказ у пользователя завершает покупатель,
+    подтверждая получение результата (app/routes/orders.py)."""
     n = now_ms()
     # Заказы, где пользователь покупатель или продавец: у продавца в «Продажах» статусы тоже актуальны.
     conn.execute(
@@ -81,16 +88,53 @@ def tick(conn: sqlite3.Connection, user_id: str) -> None:
         (ST_WORK, CONFIRM_MS, user_id, user_id, ST_WAIT, n, CONFIRM_MS),
     )
     conn.execute(
-        "UPDATE orders SET status = ? WHERE (user_id = ? OR seller_id = ?) AND status = ?"
+        "UPDATE orders SET status = ? WHERE (user_id = ? OR seller_id = ?) AND status = ? AND seller_id IS NULL"
         " AND started_at IS NOT NULL AND ? - started_at >= ?",
         (ST_DONE, user_id, user_id, ST_WORK, n, WORK_MS),
     )
+    due = conn.execute(
+        "SELECT * FROM orders WHERE (user_id = ? OR seller_id = ?) AND status = ? AND reviewed_at IS NOT NULL"
+        " AND ? - reviewed_at >= ?",
+        (user_id, user_id, ST_REVIEW, n, AUTO_CONFIRM_MS),
+    ).fetchall()
+    for o in due:
+        complete_order(conn, o, auto=True)
+
+
+def platform_add(conn: sqlite3.Connection, kind: str, coins: int, user_id=None, order_id=None, note="") -> None:
+    """Поступление на баланс платформы: комиссия за вывод (wd_fee) или доля удержания при отмене (cancel)."""
+    if coins > 0:
+        conn.execute(
+            "INSERT INTO platform_ops(kind, coins, user_id, order_id, note, ts) VALUES (?, ?, ?, ?, ?, ?)",
+            (kind, coins, user_id, order_id, note, now_ms()),
+        )
+
+
+def complete_order(conn: sqlite3.Connection, o: sqlite3.Row, auto: bool = False) -> bool:
+    """Заказ «На проверке» → «Выполнен»: монеты за оплату с баланса переводятся продавцу.
+    Условие на статус в UPDATE не даёт зачислить деньги дважды при одновременных запросах."""
+    if not conn.execute(
+        "UPDATE orders SET status = ?, confirmed_at = ? WHERE id = ? AND status = ?", (ST_DONE, now_ms(), o["id"], ST_REVIEW)
+    ).rowcount:
+        return False
+    # Оплата через СБП в демо не проверяется, поэтому продавцу переводятся только монеты с баланса покупателя.
+    paid = o["method"] == "bal" and o["seller_id"]
+    if paid:
+        add_coins(conn, o["seller_id"], o["amount"])
+        add_op(conn, o["seller_id"], "sale", "bal", o["amount"], "done", f"{o['num']} · {o['title']}")
+    who = "Получение подтверждено автоматически: прошло 7 дней" if auto else "Покупатель подтвердил получение"
+    conn.execute(
+        "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'order', ?, ?)",
+        ("u:" + o["user_id"], o["gig_id"],
+         f"{who} по заказу {o['num']}." + (f" Продавцу переведено {rub(o['amount'])}." if paid else ""), now_ms()),
+    )
+    return True
 
 
 def order_row(r: sqlite3.Row) -> list:
     # Формат строки, который ожидает dash() на фронтенде.
     return [r["num"], r["title"], r["status"], r["amount"], r["method"], r["id"], r["created_at"], r["started_at"],
-            r["gig_id"]]
+            r["gig_id"], bool(r["seller_id"])]
 
 
 def sales(conn: sqlite3.Connection, user_id: str) -> list[dict]:

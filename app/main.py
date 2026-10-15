@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
 from .db import ROOT, init_db
-from .routes import account, admin, catalog, chat, money
+from .routes import account, admin, catalog, chat, money, orders
 
 PUBLIC = (ROOT / "public").resolve()
 
@@ -21,7 +21,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="RUWORK", lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json")
-for module in (account, catalog, money, chat, admin):
+for module in (account, catalog, money, chat, admin, orders):
     app.include_router(module.router)
 
 

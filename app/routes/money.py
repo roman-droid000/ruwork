@@ -9,8 +9,8 @@ from pydantic import BaseModel
 from .. import auth
 from ..db import get_db, now_ms, tx
 from ..logic import (
-    BANKS, MAX_DEP, MIN_DEP, MIN_WD, ST_CANCEL, ST_WAIT, ST_WORK, TIERS,
-    add_coins, add_op, fee_of, get_coins, mk_tiers, new_id, nf, rub, user_state,
+    BANKS, MAX_DEP, MIN_DEP, MIN_WD, PLATFORM_CANCEL_PCT, REFUND_WORK_PCT, SBP_ORDERS, ST_CANCEL, ST_WAIT, ST_WORK, TIERS,
+    add_coins, add_op, fee_of, get_coins, mk_tiers, new_id, nf, platform_add, rub, user_state,
 )
 
 router = APIRouter(prefix="/api")
@@ -45,6 +45,8 @@ def int_amount(x: float) -> int | None:
 def create_order(body: OrderIn, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
     if body.method not in ("sbp", "bal") or not body.items:
         raise HTTPException(400, "Корзина пуста")
+    if body.method == "sbp" and not SBP_ORDERS:
+        raise HTTPException(400, "Оплата через СБП временно недоступна. Оплатите заказ с баланса.")
     with tx(conn):
         items = []
         for it in body.items:
@@ -65,16 +67,17 @@ def create_order(body: OrderIn, user=Depends(auth.require_user), conn: sqlite3.C
             add_coins(conn, user["id"], -total)
         count = conn.execute("SELECT count(*) FROM orders WHERE user_id = ?", (user["id"],)).fetchone()[0]
         ts = now_ms()
+        placed = []
         for k, (g, tier, price) in enumerate(items):
             if body.method == "bal":
                 add_op(conn, user["id"], "pay", "bal", price, "done", g["title"])
             num = f"#RW-{1040 + count + k}"
+            placed.append(new_id())
             conn.execute(
                 "INSERT INTO orders(id, user_id, num, gig_id, title, tier, status, amount, method, created_at, started_at,"
                 " seller_id, seller_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (new_id(), user["id"], num, g["id"], g["title"], tier,
-                 ST_WORK if body.method == "bal" else ST_WAIT, price, body.method, ts + k,
-                 ts if body.method == "bal" else None, g["owner_id"], 0 if g["owner_id"] else 1),
+                (placed[-1], user["id"], num, g["id"], g["title"], tier,
+                 ST_WAIT, price, body.method, ts + k, None, g["owner_id"], 0 if g["owner_id"] else 1),
             )
             # Заказ открывает диалог покупателя с продавцом: продавец видит его в «Сообщениях покупателей».
             conn.execute(
@@ -83,7 +86,7 @@ def create_order(body: OrderIn, user=Depends(auth.require_user), conn: sqlite3.C
                  f"Оформлен заказ {num}: тариф «{TIERS[tier][0]}», {rub(price)}"
                  + (", оплачен с баланса" if body.method == "bal" else ", оплата через СБП"), ts + k),
             )
-        return user_state(conn, user["id"])
+        return {"placed": placed, **user_state(conn, user["id"])}
 
 
 @router.post("/orders/{order_id}/cancel")
@@ -98,10 +101,22 @@ def cancel_order(order_id: str, user=Depends(auth.require_user), conn: sqlite3.C
             "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'order', ?, ?)",
             ("u:" + user["id"], o["gig_id"], f"Покупатель отменил заказ {o['num']}", now_ms()),
         )
+        # Монеты возвращаются только за оплату с баланса: до подтверждения 100 %, после перехода «В работе» 90 %.
+        # Оплата через СБП не проверяется (демо), поэтому её отмена монеты не начисляет.
+        # Удержанные 10 % делятся: 5 % суммы — платформе, остаток — продавцу за начатую работу
+        # (у услуг каталога RUWORK продавца нет, там всё удержание уходит платформе).
+        refund = 0
         if o["method"] == "bal":
-            add_coins(conn, user["id"], o["amount"])
-            add_op(conn, user["id"], "ref", "bal", o["amount"], "done", o["title"])
-        return {"refund": o["amount"] if o["method"] == "bal" else 0, **user_state(conn, user["id"])}
+            refund = o["amount"] if o["status"] == ST_WAIT else o["amount"] * REFUND_WORK_PCT // 100
+            add_coins(conn, user["id"], refund)
+            add_op(conn, user["id"], "ref", "bal", refund, "done", o["title"])
+            kept = o["amount"] - refund
+            fee = kept if not o["seller_id"] else min(kept, o["amount"] * PLATFORM_CANCEL_PCT // 100)
+            platform_add(conn, "cancel", fee, user["id"], o["id"], f"{o['num']} · {o['title']}")
+            if o["seller_id"] and kept > fee:
+                add_coins(conn, o["seller_id"], kept - fee)
+                add_op(conn, o["seller_id"], "comp", "bal", kept - fee, "done", f"{o['num']} · {o['title']}")
+        return {"refund": refund, **user_state(conn, user["id"])}
 
 
 @router.post("/sales/seen")

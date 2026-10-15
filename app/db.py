@@ -11,6 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.environ.get("RUWORK_DB", ROOT / "ruwork.db"))
 SEED_PATH = Path(__file__).resolve().parent / "seed.json"
+# Загруженные файлы: обложки объявлений и результаты заказов. Папка не в git, выкладка её не трогает.
+UPLOAD_DIR = Path(os.environ.get("RUWORK_UPLOADS", ROOT / "uploads"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -87,6 +89,26 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     ts     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chat_owner_gig ON chat_messages(owner, gig_id, id);
+CREATE TABLE IF NOT EXISTS order_files (
+    id       TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    name     TEXT NOT NULL,
+    mime     TEXT NOT NULL,
+    size     INTEGER NOT NULL,
+    received INTEGER NOT NULL DEFAULT 0,
+    done     INTEGER NOT NULL DEFAULT 0,
+    ts       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS order_files_order ON order_files(order_id, ts);
+CREATE TABLE IF NOT EXISTS platform_ops (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind     TEXT NOT NULL,
+    coins    INTEGER NOT NULL,
+    user_id  TEXT,
+    order_id TEXT,
+    note     TEXT NOT NULL DEFAULT '',
+    ts       INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS password_resets (
     id      TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -183,6 +205,24 @@ def init_db() -> None:
             conn.execute("ALTER TABLE orders ADD COLUMN seller_seen INTEGER NOT NULL DEFAULT 1")
             conn.execute("UPDATE orders SET seller_id = (SELECT owner_id FROM gigs WHERE gigs.id = orders.gig_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS orders_seller ON orders(seller_id, created_at)")
+        # Миграция: время подтверждения получения результата покупателем.
+        if "confirmed_at" not in ocols:
+            conn.execute("ALTER TABLE orders ADD COLUMN confirmed_at INTEGER")
+        # Миграция: когда заказ перешёл «На проверке» — от этого времени считается автоподтверждение.
+        if "reviewed_at" not in ocols:
+            conn.execute("ALTER TABLE orders ADD COLUMN reviewed_at INTEGER")
+            conn.execute("UPDATE orders SET reviewed_at = ? WHERE status = 'На проверке'", (now_ms(),))
+        # Миграция: баланс платформы начинается с комиссий уже одобренных выводов.
+        if not conn.execute("SELECT 1 FROM platform_ops LIMIT 1").fetchone():
+            conn.execute(
+                "INSERT INTO platform_ops(kind, coins, user_id, note, ts) SELECT 'wd_fee', fee, user_id, dest, ts"
+                " FROM wallet_ops WHERE t = 'wd' AND status = 'done' AND fee > 0"
+            )
+        # Миграция: обложка объявления (имя файла в UPLOAD_DIR/covers).
+        if "cover" not in {r[1] for r in conn.execute("PRAGMA table_info(gigs)")}:
+            conn.execute("ALTER TABLE gigs ADD COLUMN cover TEXT")
+        for sub in ("covers", "results"):
+            (UPLOAD_DIR / sub).mkdir(parents=True, exist_ok=True)
         with tx(conn):
             for name, (about, reviews) in SEED["sellers"].items():
                 conn.execute(
