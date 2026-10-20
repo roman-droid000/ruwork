@@ -10,7 +10,7 @@ from .. import auth
 from ..db import get_db, now_ms, tx
 from ..logic import (
     BANKS, MAX_DEP, MIN_DEP, MIN_WD, PLATFORM_CANCEL_PCT, REFUND_WORK_PCT, SBP_ORDERS, ST_CANCEL, ST_WAIT, ST_WORK, TIERS,
-    add_coins, add_op, fee_of, get_coins, mk_tiers, new_id, nf, platform_add, rub, user_state,
+    add_coins, add_op, fee_of, get_coins, mk_tiers, new_id, nf, notify, platform_add, rub, user_state,
 )
 
 router = APIRouter(prefix="/api")
@@ -55,7 +55,7 @@ def create_order(body: OrderIn, user=Depends(auth.require_user), conn: sqlite3.C
                 " WHERE g.id = ? AND u.blocked_at IS NULL",
                 (it.id,),
             ).fetchone()
-            if not g or not 0 <= it.tier < 3:
+            if not g or not 0 <= it.tier < len(TIERS):
                 raise HTTPException(400, "Услуга не найдена. Обновите страницу.")
             if g["owner_id"] == user["id"]:
                 raise HTTPException(400, "Нельзя заказать собственную услугу")
@@ -74,9 +74,9 @@ def create_order(body: OrderIn, user=Depends(auth.require_user), conn: sqlite3.C
             num = f"#RW-{1040 + count + k}"
             placed.append(new_id())
             conn.execute(
-                "INSERT INTO orders(id, user_id, num, gig_id, title, tier, status, amount, method, created_at, started_at,"
-                " seller_id, seller_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (placed[-1], user["id"], num, g["id"], g["title"], tier,
+                "INSERT INTO orders(id, user_id, num, gig_id, title, tier, tier_name, status, amount, method, created_at,"
+                " started_at, seller_id, seller_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (placed[-1], user["id"], num, g["id"], g["title"], tier, TIERS[tier][0],
                  ST_WAIT, price, body.method, ts + k, None, g["owner_id"], 0 if g["owner_id"] else 1),
             )
             # Заказ открывает диалог покупателя с продавцом: продавец видит его в «Сообщениях покупателей».
@@ -86,6 +86,8 @@ def create_order(body: OrderIn, user=Depends(auth.require_user), conn: sqlite3.C
                  f"Оформлен заказ {num}: тариф «{TIERS[tier][0]}», {rub(price)}"
                  + (", оплачен с баланса" if body.method == "bal" else ", оплата через СБП"), ts + k),
             )
+            notify(conn, g["owner_id"], "sale", f"Новый заказ {num}: «{g['title']}», тариф «{TIERS[tier][0]}», {rub(price)}",
+                   f"#/order/{placed[-1]}")
         return {"placed": placed, **user_state(conn, user["id"])}
 
 
@@ -101,6 +103,7 @@ def cancel_order(order_id: str, user=Depends(auth.require_user), conn: sqlite3.C
             "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'order', ?, ?)",
             ("u:" + user["id"], o["gig_id"], f"Покупатель отменил заказ {o['num']}", now_ms()),
         )
+        notify(conn, o["seller_id"], "cancel", f"Покупатель отменил заказ {o['num']} «{o['title']}».", f"#/order/{o['id']}")
         # Монеты возвращаются только за оплату с баланса: до подтверждения 100 %, после перехода «В работе» 90 %.
         # Оплата через СБП не проверяется (демо), поэтому её отмена монеты не начисляет.
         # Удержанные 10 % делятся: 5 % суммы — платформе, остаток — продавцу за начатую работу

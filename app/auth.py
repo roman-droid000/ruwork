@@ -112,7 +112,10 @@ def require_admin(user: sqlite3.Row = Depends(require_user)) -> sqlite3.Row:
 def public_user(user: sqlite3.Row | None) -> dict | None:
     if user is None:
         return None
-    out = {"id": user["id"], "name": user["name"], "email": user["email"]}
+    out = {"id": user["id"], "name": user["name"], "email": user["email"],
+           "about": user["about"] if "about" in user.keys() else "",
+           "avatar": user["avatar"] if "avatar" in user.keys() else None,
+           "tg": bool(user["tg_chat"]) if "tg_chat" in user.keys() else False}
     if is_admin(user):
         out["admin"] = True
     return out

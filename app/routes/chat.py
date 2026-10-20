@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from .. import auth
 from ..db import get_db, now_ms
-from ..logic import ai_prompt, gig_out, greeting, local_reply
+from ..logic import SOLD_SQL, ai_prompt, gig_out, greeting, local_reply, notify
 
 router = APIRouter(prefix="/api")
 log = logging.getLogger("ruwork.chat")
@@ -48,7 +48,7 @@ def chat_owner(request: Request, response: Response, user) -> str:
 
 
 def load_gig(conn: sqlite3.Connection, gig_id: str) -> dict:
-    row = conn.execute("SELECT * FROM gigs WHERE id = ?", (gig_id,)).fetchone()
+    row = conn.execute(f"SELECT g.*, {SOLD_SQL} FROM gigs g WHERE g.id = ?", (gig_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Кворк не найден")
     return gig_out(row)
@@ -135,6 +135,8 @@ async def send_message(gig_id: str, body: MessageIn, request: Request, response:
             "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'me', ?, ?)",
             (owner, gig_id, text, now_ms()),
         )
+        notify(conn, g["owner"], "msg", f"Новое сообщение от {user['name']} по «{g['title']}»: {text[:120]}",
+               f"#/gig/{gig_id}")
         return history(conn, owner, gig_id)
     owner = chat_owner(request, response, user)
     conn.execute(
@@ -169,4 +171,5 @@ def seller_reply(gig_id: str, body: ReplyIn, user=Depends(auth.require_user),
         "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'seller', ?, ?)",
         (owner, gig_id, text, now_ms()),
     )
+    notify(conn, body.to, "msg", f"Продавец {g['seller']} ответил по «{g['title']}»: {text[:120]}", f"#/gig/{gig_id}")
     return threads(conn, gig_id)

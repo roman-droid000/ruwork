@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS orders (
     started_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS orders_user ON orders(user_id, created_at);
+CREATE INDEX IF NOT EXISTS orders_gig ON orders(gig_id, status);
 CREATE TABLE IF NOT EXISTS wallets (
     user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     coins   INTEGER NOT NULL DEFAULT 0
@@ -100,6 +101,22 @@ CREATE TABLE IF NOT EXISTS order_files (
     ts       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS order_files_order ON order_files(order_id, ts);
+CREATE TABLE IF NOT EXISTS notifications (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind    TEXT NOT NULL,
+    text    TEXT NOT NULL,
+    link    TEXT NOT NULL DEFAULT '',
+    read    INTEGER NOT NULL DEFAULT 0,
+    ts      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, id);
+CREATE TABLE IF NOT EXISTS favorites (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    gig_id  TEXT NOT NULL,
+    ts      INTEGER NOT NULL,
+    PRIMARY KEY (user_id, gig_id)
+);
 CREATE TABLE IF NOT EXISTS platform_ops (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     kind     TEXT NOT NULL,
@@ -109,6 +126,21 @@ CREATE TABLE IF NOT EXISTS platform_ops (
     note     TEXT NOT NULL DEFAULT '',
     ts       INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reviews (
+    id        TEXT PRIMARY KEY,
+    order_id  TEXT NOT NULL UNIQUE,
+    gig_id    TEXT NOT NULL,
+    seller_id TEXT,
+    buyer_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    stars     INTEGER NOT NULL,
+    text      TEXT NOT NULL,
+    photo     TEXT,
+    reply     TEXT NOT NULL DEFAULT '',
+    reply_at  INTEGER,
+    ts        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reviews_gig ON reviews(gig_id, ts);
+CREATE INDEX IF NOT EXISTS reviews_seller ON reviews(seller_id, ts);
 CREATE TABLE IF NOT EXISTS password_resets (
     id      TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -117,6 +149,11 @@ CREATE TABLE IF NOT EXISTS password_resets (
     hash    TEXT NOT NULL,
     status  TEXT NOT NULL,
     ts      INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tg_support (
+    admin_msg   INTEGER PRIMARY KEY,
+    client_chat INTEGER NOT NULL,
+    ts          INTEGER NOT NULL
 );
 """
 
@@ -205,6 +242,7 @@ def init_db() -> None:
             conn.execute("ALTER TABLE orders ADD COLUMN seller_seen INTEGER NOT NULL DEFAULT 1")
             conn.execute("UPDATE orders SET seller_id = (SELECT owner_id FROM gigs WHERE gigs.id = orders.gig_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS orders_seller ON orders(seller_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS orders_seller_status ON orders(seller_id, status)")
         # Миграция: время подтверждения получения результата покупателем.
         if "confirmed_at" not in ocols:
             conn.execute("ALTER TABLE orders ADD COLUMN confirmed_at INTEGER")
@@ -218,10 +256,42 @@ def init_db() -> None:
                 "INSERT INTO platform_ops(kind, coins, user_id, note, ts) SELECT 'wd_fee', fee, user_id, dest, ts"
                 " FROM wallet_ops WHERE t = 'wd' AND status = 'done' AND fee > 0"
             )
+        # Миграция: название тарифа хранится в заказе. Старые заказы — по прежней тройке тарифов.
+        if "tier_name" not in {r[1] for r in conn.execute("PRAGMA table_info(orders)")}:
+            conn.execute("ALTER TABLE orders ADD COLUMN tier_name TEXT NOT NULL DEFAULT ''")
+            conn.execute("UPDATE orders SET tier_name = CASE tier WHEN 0 THEN 'Эконом' WHEN 1 THEN 'Стандарт'"
+                         " WHEN 2 THEN 'Бизнес' ELSE '' END")
+        # Миграция: спор по заказу и напоминание покупателю за сутки до автоподтверждения.
+        ocols = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
+        if "dispute_at" not in ocols:
+            conn.execute("ALTER TABLE orders ADD COLUMN dispute_at INTEGER")
+            conn.execute("ALTER TABLE orders ADD COLUMN dispute_reason TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE orders ADD COLUMN dispute_result TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE orders ADD COLUMN reminded INTEGER NOT NULL DEFAULT 0")
+        # Миграция: «О себе» для публичного профиля продавца.
+        if "about" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN about TEXT NOT NULL DEFAULT ''")
         # Миграция: обложка объявления (имя файла в UPLOAD_DIR/covers).
         if "cover" not in {r[1] for r in conn.execute("PRAGMA table_info(gigs)")}:
             conn.execute("ALTER TABLE gigs ADD COLUMN cover TEXT")
-        for sub in ("covers", "results"):
+        # Миграция: фото профиля (имя файла в UPLOAD_DIR/avatars); в gigs — копия для карточек, как и имя продавца.
+        if "avatar" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN avatar TEXT")
+        if "seller_avatar" not in {r[1] for r in conn.execute("PRAGMA table_info(gigs)")}:
+            conn.execute("ALTER TABLE gigs ADD COLUMN seller_avatar TEXT")
+        # Миграция: привязка Telegram (chat_id) и одноразовый код для /start.
+        if "tg_chat" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN tg_chat INTEGER")
+            conn.execute("ALTER TABLE users ADD COLUMN tg_code TEXT")
+        # Миграция: поднятие объявления (раз в сутки бесплатно) и платное продвижение до promo_until.
+        gcols = {r[1] for r in conn.execute("PRAGMA table_info(gigs)")}
+        if "bumped_at" not in gcols:
+            conn.execute("ALTER TABLE gigs ADD COLUMN bumped_at INTEGER")
+            conn.execute("ALTER TABLE gigs ADD COLUMN promo_until INTEGER")
+        # Миграция: значок «Проверенный продавец», который ставит администратор.
+        if "verified" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
+        for sub in ("covers", "results", "avatars", "reviews"):
             (UPLOAD_DIR / sub).mkdir(parents=True, exist_ok=True)
         with tx(conn):
             for name, (about, reviews) in SEED["sellers"].items():

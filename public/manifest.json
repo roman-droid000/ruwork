@@ -1,0 +1,14 @@
+{
+  "name": "RUWORK — фриланс-услуги",
+  "short_name": "RUWORK",
+  "lang": "ru",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0B0B12",
+  "theme_color": "#0B0C10",
+  "icons": [
+    {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}

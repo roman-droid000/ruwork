@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from .. import auth
 from ..db import get_db, now_ms, tx
-from ..logic import esc, new_id, user_state
+from ..logic import esc, new_id, unread_notes, user_state
 
 router = APIRouter(prefix="/api")
 
@@ -134,11 +134,11 @@ def logout(request: Request, response: Response, conn: sqlite3.Connection = Depe
 def ping(user=Depends(auth.optional_user), conn: sqlite3.Connection = Depends(get_db)):
     """Пульс открытой вкладки: optional_user обновляет last_seen, по нему строится список «Онлайн».
     auth=false сообщает странице, что сессия завершена (например, пользователя заблокировали).
-    new_sales — сколько покупок у продавца ещё без уведомления."""
+    new_sales — сколько покупок у продавца ещё без уведомления, notes — непрочитанные уведомления колокольчика."""
     if user is None:
-        return {"ok": True, "auth": False, "new_sales": 0}
+        return {"ok": True, "auth": False, "new_sales": 0, "notes": 0}
     n = conn.execute("SELECT count(*) FROM orders WHERE seller_id = ? AND seller_seen = 0", (user["id"],)).fetchone()[0]
-    return {"ok": True, "auth": True, "new_sales": n}
+    return {"ok": True, "auth": True, "new_sales": n, "notes": unread_notes(conn, user["id"])}
 
 
 @router.get("/state")
