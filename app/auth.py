@@ -3,9 +3,11 @@
 import base64
 import hashlib
 import hmac
+import os
 import re
 import secrets
 import sqlite3
+import time
 
 from fastapi import Depends, HTTPException, Request, Response
 
@@ -20,6 +22,11 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
 # Единственный аккаунт администратора. Пароль задаётся при первом запуске через RUWORK_ADMIN_PASSWORD.
 ADMIN_EMAIL = "phantom.crypta@mail.ru"
 ADMIN_NAME = "ruwork.shop"
+# Модератор (users.role = 'moder'): жалобы, объявления, споры, пользователи и чаты, но не деньги.
+ROLES = {"moder": "Модератор"}
+# Второй фактор для админ-панели: код из Telegram, подтверждение действует MFA_TTL_MS в этой сессии.
+# Работает, только если настроен бот; RUWORK_ADMIN_2FA=0 выключает (например, для локальной разработки).
+MFA_TTL_MS = 12 * 3600 * 1000
 
 
 def b64(data: bytes) -> str:
@@ -74,6 +81,19 @@ def end_session(conn: sqlite3.Connection, request: Request, response: Response) 
     response.delete_cookie(SESSION_COOKIE, path="/")
 
 
+def client_ip(request: Request) -> str:
+    """Адрес посетителя. За nginx настоящий адрес приходит в X-Real-IP / X-Forwarded-For."""
+    ip = request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    return (ip or (request.client.host if request.client else "?"))[:64]
+
+
+def remember_ip(conn: sqlite3.Connection, user_id: str, ip: str) -> None:
+    """Адреса, с которых заходил пользователь: по общим адресам админка ищет связанные аккаунты."""
+    n = now_ms()
+    conn.execute("INSERT INTO user_ips(user_id, ip, first_ts, last_ts) VALUES (?, ?, ?, ?)"
+                 " ON CONFLICT(user_id, ip) DO UPDATE SET last_ts = excluded.last_ts", (user_id, ip, n, n))
+
+
 def optional_user(request: Request, conn: sqlite3.Connection = Depends(get_db)) -> sqlite3.Row | None:
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
@@ -85,12 +105,15 @@ def optional_user(request: Request, conn: sqlite3.Connection = Depends(get_db)) 
     ).fetchone()
     if user is not None and (user["last_seen"] or 0) < now_ms() - SEEN_THROTTLE_MS and not conn.in_transaction:
         conn.execute("UPDATE users SET last_seen = ? WHERE id = ?", (now_ms(), user["id"]))
+        remember_ip(conn, user["id"], client_ip(request))
     return user
 
 
 def blocked_message(user: sqlite3.Row) -> str:
-    reason = user["block_reason"]
-    return "Аккаунт заблокирован администратором" + (f". Причина: {reason}" if reason else "")
+    reason, until = user["block_reason"], user["blocked_until"]
+    return ("Аккаунт заблокирован администратором"
+            + (" до " + time.strftime("%d.%m.%Y %H:%M", time.localtime(until / 1000)) if until else "")
+            + (f". Причина: {reason}" if reason else ""))
 
 
 def require_user(user: sqlite3.Row | None = Depends(optional_user)) -> sqlite3.Row:
@@ -103,9 +126,46 @@ def is_admin(user: sqlite3.Row | None) -> bool:
     return user is not None and user["email"] == ADMIN_EMAIL
 
 
-def require_admin(user: sqlite3.Row = Depends(require_user)) -> sqlite3.Row:
-    if not is_admin(user):
+def staff_role(user: sqlite3.Row | None) -> str:
+    """'admin' — владелец, 'moder' — модератор, '' — обычный пользователь."""
+    if user is None:
+        return ""
+    if is_admin(user):
+        return "admin"
+    return user["role"] if user["role"] in ROLES else ""
+
+
+def mfa_on() -> bool:
+    from . import tg
+    return bool(tg.TOKEN) and os.environ.get("RUWORK_ADMIN_2FA", "1") != "0"
+
+
+def session_row(conn: sqlite3.Connection, request: Request) -> sqlite3.Row | None:
+    token = request.cookies.get(SESSION_COOKIE)
+    return conn.execute("SELECT * FROM sessions WHERE token = ?", (token,)).fetchone() if token else None
+
+
+def mfa_ok(conn: sqlite3.Connection, request: Request) -> bool:
+    if not mfa_on():
+        return True
+    s = session_row(conn, request)
+    return bool(s and s["mfa_at"] and s["mfa_at"] > now_ms() - MFA_TTL_MS)
+
+
+def require_staff(request: Request, user: sqlite3.Row = Depends(require_user),
+                  conn: sqlite3.Connection = Depends(get_db)) -> sqlite3.Row:
+    """Админ-панель: сотрудник и подтверждённый в этой сессии код из Telegram (428 — нужен код)."""
+    if not staff_role(user):
         raise HTTPException(403, "Нет доступа")
+    if not mfa_ok(conn, request):
+        raise HTTPException(428, "Подтвердите вход в админ-панель кодом из Telegram")
+    return user
+
+
+def require_admin(user: sqlite3.Row = Depends(require_staff)) -> sqlite3.Row:
+    """Только владелец: деньги, заявки, роли, настройки, журнал."""
+    if not is_admin(user):
+        raise HTTPException(403, "Это действие доступно только администратору")
     return user
 
 
@@ -115,7 +175,11 @@ def public_user(user: sqlite3.Row | None) -> dict | None:
     out = {"id": user["id"], "name": user["name"], "email": user["email"],
            "about": user["about"] if "about" in user.keys() else "",
            "avatar": user["avatar"] if "avatar" in user.keys() else None,
-           "tg": bool(user["tg_chat"]) if "tg_chat" in user.keys() else False}
+           "tg": bool(user["tg_chat"]) if "tg_chat" in user.keys() else False,
+           "vacation_until": user["vacation_until"] if "vacation_until" in user.keys() else None,
+           "vacation_note": user["vacation_note"] if "vacation_note" in user.keys() else ""}
     if is_admin(user):
         out["admin"] = True
+    if staff_role(user):
+        out["staff"] = staff_role(user)
     return out

@@ -16,9 +16,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from .. import auth
+from .. import auth, guard
 from ..db import UPLOAD_DIR, get_db, now_ms, tx
-from ..logic import AUTO_CONFIRM_MS, ST_DISPUTE, ST_REVIEW, ST_WORK, complete_order, gig_is_top, notify, user_state
+from ..logic import (
+    AUTO_CONFIRM_MS, EXT_MAX_DAYS, ST_DISPUTE, ST_REVIEW, ST_WORK, complete_order, deadline, gig_is_top, notify, user_state,
+)
 
 router = APIRouter()
 
@@ -118,13 +120,13 @@ def cover_file(name: str):
 
 
 def load_order(conn: sqlite3.Connection, order_id: str, user) -> tuple[sqlite3.Row, str]:
-    """Заказ и роль смотрящего: покупатель, продавец или администратор (только просмотр)."""
+    """Заказ и роль смотрящего: покупатель, продавец или сотрудник (только просмотр)."""
     o = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
     if o and o["user_id"] == user["id"]:
         return o, "buyer"
     if o and o["seller_id"] and o["seller_id"] == user["id"]:
         return o, "seller"
-    if o and auth.is_admin(user):
+    if o and auth.staff_role(user):  # администратор и модератор — для разбора споров
         return o, "admin"
     raise HTTPException(404, "Заказ не найден")
 
@@ -150,6 +152,9 @@ def order_detail(conn: sqlite3.Connection, o: sqlite3.Row, role: str) -> dict:
         # Покупатель видит только полностью загруженные файлы; продавец — и недогруженные, чтобы удалить их.
         "files": [dict(f) for f in files if f["done"] or role == "seller"],
         "review": order_review(conn, o["id"]),
+        "started_at": o["started_at"], "delivered_at": o["delivered_at"], "reviewed_at": o["reviewed_at"],
+        "days": o["days"], "extra_days": o["extra_days"], "deadline": deadline(o),
+        "revs": o["revs"], "revs_used": o["revs_used"], "ext_days": o["ext_days"], "ext_reason": o["ext_reason"],
     }
 
 
@@ -217,8 +222,8 @@ async def put_chunk(order_id: str, file_id: str, offset: int, request: Request, 
     with tx(conn):
         conn.execute("UPDATE order_files SET received = ?, done = ? WHERE id = ?", (received, int(done), file_id))
         if done:
-            conn.execute("UPDATE orders SET status = ?, reviewed_at = ? WHERE id = ? AND status = ?",
-                         (ST_REVIEW, now_ms(), o["id"], ST_WORK))
+            conn.execute("UPDATE orders SET status = ?, reviewed_at = ?, delivered_at = coalesce(delivered_at, ?)"
+                         " WHERE id = ? AND status = ?", (ST_REVIEW, now_ms(), now_ms(), o["id"], ST_WORK))
             conn.execute(
                 "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'order', ?, ?)",
                 ("u:" + o["user_id"], o["gig_id"],
@@ -303,6 +308,8 @@ def open_dispute(order_id: str, body: DisputeIn, user=Depends(auth.require_user)
                       now_ms()))
         notify(conn, o["seller_id"], "dispute", f"Покупатель открыл спор по заказу {o['num']} «{o['title']}»: {reason[:120]}",
                f"#/order/{o['id']}")
+        guard.alert(f"Новый спор по заказу {o['num']} «{o['title']}» на {o['amount']} мон.: {reason[:200]}",
+                    "#/admin/disputes")
         return order_detail(conn, conn.execute("SELECT * FROM orders WHERE id = ?", (o["id"],)).fetchone(), "buyer")
 
 
@@ -321,3 +328,93 @@ def close_dispute(order_id: str, user=Depends(auth.require_user), conn: sqlite3.
         notify(conn, o["seller_id"], "dispute", f"Покупатель закрыл спор по заказу {o['num']} «{o['title']}».",
                f"#/order/{o['id']}")
         return order_detail(conn, conn.execute("SELECT * FROM orders WHERE id = ?", (o["id"],)).fetchone(), "buyer")
+
+
+def order_msg(conn: sqlite3.Connection, o: sqlite3.Row, text: str) -> None:
+    conn.execute("INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'order', ?, ?)",
+                 ("u:" + o["user_id"], o["gig_id"], text, now_ms()))
+
+
+def fresh(conn: sqlite3.Connection, o: sqlite3.Row, role: str) -> dict:
+    return order_detail(conn, conn.execute("SELECT * FROM orders WHERE id = ?", (o["id"],)).fetchone(), role)
+
+
+class RevisionIn(BaseModel):
+    text: str
+
+
+@router.post("/api/orders/{order_id}/revision")
+def send_revision(order_id: str, body: RevisionIn, user=Depends(auth.require_user),
+                  conn: sqlite3.Connection = Depends(get_db)):
+    """Покупатель отправляет результат на доработку: тратится одна правка из тарифа, заказ снова «В работе»,
+    автоподтверждение останавливается до новой загрузки результата."""
+    text = body.text.strip()[:1000]
+    if len(text) < 5:
+        raise HTTPException(400, "Напишите, что нужно исправить")
+    with tx(conn):
+        user_state(conn, user["id"])
+        o, role = load_order(conn, order_id, user)
+        if role != "buyer" or not o["seller_id"]:
+            raise HTTPException(403, "Отправить на доработку может только покупатель")
+        if o["status"] != ST_REVIEW:
+            raise HTTPException(400, "На доработку можно отправить результат, который ждёт проверки")
+        if o["revs_used"] >= o["revs"]:
+            raise HTTPException(400, "Все правки по тарифу использованы. Договоритесь с продавцом в чате или откройте спор.")
+        conn.execute("UPDATE orders SET status = ?, reviewed_at = NULL, reminded = 0, revs_used = revs_used + 1 WHERE id = ?",
+                     (ST_WORK, o["id"]))
+        n = o["revs_used"] + 1
+        order_msg(conn, o, f"Покупатель отправил заказ {o['num']} на доработку (правка {n} из {o['revs']}): {text}")
+        notify(conn, o["seller_id"], "result", f"Заказ {o['num']} «{o['title']}» отправлен на доработку: {text[:120]}",
+               f"#/order/{o['id']}")
+        return fresh(conn, o, "buyer")
+
+
+class ExtendIn(BaseModel):
+    days: int
+    reason: str
+
+
+@router.post("/api/orders/{order_id}/extend")
+def ask_extend(order_id: str, body: ExtendIn, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
+    """Продавец просит продлить срок. Срок меняется, только если покупатель согласится."""
+    reason = body.reason.strip()[:500]
+    if not 1 <= body.days <= EXT_MAX_DAYS:
+        raise HTTPException(400, f"Продлить можно на 1–{EXT_MAX_DAYS} дней")
+    if len(reason) < 5:
+        raise HTTPException(400, "Объясните покупателю, зачем нужно больше времени")
+    with tx(conn):
+        user_state(conn, user["id"])
+        o, role = load_order(conn, order_id, user)
+        if role != "seller":
+            raise HTTPException(403, "Попросить продление может только продавец")
+        if o["status"] != ST_WORK:
+            raise HTTPException(400, "Продлить срок можно, пока заказ в работе")
+        if o["ext_days"]:
+            raise HTTPException(400, "Запрос уже отправлен — дождитесь ответа покупателя")
+        conn.execute("UPDATE orders SET ext_days = ?, ext_reason = ? WHERE id = ?", (body.days, reason, o["id"]))
+        order_msg(conn, o, f"Продавец просит продлить срок заказа {o['num']} на {body.days} дн.: {reason}")
+        notify(conn, o["user_id"], "remind", f"Продавец просит продлить срок заказа {o['num']} на {body.days} дн. Ответьте на странице заказа.",
+               f"#/order/{o['id']}")
+        return fresh(conn, o, "seller")
+
+
+@router.post("/api/orders/{order_id}/extend/{act}")
+def answer_extend(order_id: str, act: str, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
+    if act not in ("accept", "decline"):
+        raise HTTPException(400, "Неизвестное действие")
+    with tx(conn):
+        o, role = load_order(conn, order_id, user)
+        if role != "buyer":
+            raise HTTPException(403, "Ответить на запрос может только покупатель")
+        if not o["ext_days"]:
+            raise HTTPException(400, "Запроса на продление нет")
+        days = o["ext_days"]
+        # Срок сдвинулся — напоминания о нём начинаются заново.
+        conn.execute("UPDATE orders SET extra_days = extra_days + ?, ext_days = 0, ext_reason = '',"
+                     " dl_reminded = CASE WHEN ? THEN 0 ELSE dl_reminded END WHERE id = ?",
+                     (days if act == "accept" else 0, act == "accept", o["id"]))
+        text = (f"Покупатель согласился продлить срок заказа {o['num']} на {days} дн." if act == "accept"
+                else f"Покупатель отказался продлевать срок заказа {o['num']}.")
+        order_msg(conn, o, text)
+        notify(conn, o["seller_id"], "remind", text, f"#/order/{o['id']}")
+        return fresh(conn, o, "buyer")

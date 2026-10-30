@@ -5,9 +5,12 @@ import sqlite3
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from .. import auth, support, tg
+from .. import auth, guard, support, tg
 from ..db import get_db, now_ms
-from ..logic import SOLD_SQL, ST_CANCEL, ST_DONE, TOP_SELLER_SALES, esc, gig_out, response_times, seller_ratings, unread_notes
+from ..logic import (
+    SOLD_SQL, ST_CANCEL, ST_DONE, TOP_SELLER_SALES, esc, gig_out, response_times, seller_level, seller_ratings, unread_notes,
+)
+from .market import portfolio
 
 router = APIRouter(prefix="/api")
 
@@ -50,7 +53,7 @@ def toggle_fav(gig_id: str, user=Depends(auth.require_user), conn: sqlite3.Conne
 
 @router.patch("/me/about")
 def change_about(body: AboutIn, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
-    about = esc(body.about.strip())[:600]
+    about = esc(guard.mask_contacts(body.about.strip()))[:600]
     conn.execute("UPDATE users SET about = ? WHERE id = ?", (about, user["id"]))
     return {"me": auth.public_user(conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone())}
 
@@ -58,7 +61,8 @@ def change_about(body: AboutIn, user=Depends(auth.require_user), conn: sqlite3.C
 @router.get("/sellers/{user_id}")
 def seller_profile(user_id: str, conn: sqlite3.Connection = Depends(get_db)):
     """Публичный профиль продавца: без email и баланса."""
-    u = conn.execute("SELECT id, name, about, avatar, created_at, blocked_at, last_seen, verified FROM users WHERE id = ?",
+    u = conn.execute("SELECT id, name, about, avatar, created_at, blocked_at, last_seen, verified, vacation_until, vacation_note"
+                     " FROM users WHERE id = ?",
                      (user_id,)).fetchone()
     if not u or u["blocked_at"] is not None:
         raise HTTPException(404, "Продавец не найден")
@@ -67,7 +71,7 @@ def seller_profile(user_id: str, conn: sqlite3.Connection = Depends(get_db)):
         "SELECT count(*) FROM orders WHERE seller_id = ? AND status NOT IN (?, 'Отменён')", (user_id, ST_DONE)
     ).fetchone()[0]
     gigs = conn.execute(
-        f"SELECT g.*, {SOLD_SQL} FROM gigs g WHERE g.owner_id = ? ORDER BY g.created_at DESC", (user_id,)
+        f"SELECT g.*, {SOLD_SQL} FROM gigs g WHERE g.owner_id = ? AND g.mod = 'ok' ORDER BY g.created_at DESC", (user_id,)
     ).fetchall()
     # Доля завершённых сделок (выполненных и отменённых) без спора.
     closed, calm = conn.execute(
@@ -75,16 +79,27 @@ def seller_profile(user_id: str, conn: sqlite3.Connection = Depends(get_db)):
         (user_id, ST_DONE, ST_CANCEL),
     ).fetchone()
     rating, rev = seller_ratings(conn).get(user_id, (0, 0))
+    lvl = seller_level(conn, user_id, full=True)
     return {"id": u["id"], "name": u["name"], "about": u["about"], "avatar": u["avatar"], "since": u["created_at"], "done": done,
             "active": active, "top_seller": done > TOP_SELLER_SALES, "gigs": [gig_out(r) for r in gigs],
             "rating": rating, "rev": rev, "verified": bool(u["verified"]), "resp": response_times(conn).get(user_id),
             "online": (u["last_seen"] or 0) >= now_ms() - auth.ONLINE_MS,
-            "calm_pct": round(100 * calm / closed) if closed else None}
+            "calm_pct": round(100 * calm / closed) if closed else None,
+            "level": lvl["name"], "level_idx": lvl["idx"], "on_time": lvl["stats"]["on_time"] if lvl["stats"]["done"] else None,
+            "away": u["vacation_until"] if (u["vacation_until"] or 0) > now_ms() else None, "away_note": u["vacation_note"],
+            "portfolio": portfolio(conn, user_id)}
+
+
+# Telegram сотрудника — второй фактор входа в админку: с сайта его не отвязать и не сменить,
+# иначе укравший пароль привязал бы свой Telegram. Сменить можно только в базе на сервере.
+STAFF_TG = "Telegram сотрудника служит для входа в админ-панель и меняется только через владельца сайта"
 
 
 @router.post("/me/telegram")
 def telegram_link(user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
     """Ссылка на бота с одноразовым кодом: после /start <код> бот привяжет этот чат к аккаунту."""
+    if auth.staff_role(user) and user["tg_chat"]:
+        raise HTTPException(403, STAFF_TG)
     if not (tg.TOKEN and tg.username):
         raise HTTPException(400, "Уведомления в Telegram пока не настроены")
     code = tg.new_link_code()
@@ -94,6 +109,8 @@ def telegram_link(user=Depends(auth.require_user), conn: sqlite3.Connection = De
 
 @router.delete("/me/telegram")
 def telegram_unlink(user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
+    if auth.staff_role(user):
+        raise HTTPException(403, STAFF_TG)
     row = conn.execute("SELECT tg_chat FROM users WHERE id = ?", (user["id"],)).fetchone()
     conn.execute("UPDATE users SET tg_chat = NULL, tg_code = NULL WHERE id = ?", (user["id"],))
     tg.send(row["tg_chat"], "Уведомления RUWORK отключены. Подключить снова можно в профиле на сайте.")

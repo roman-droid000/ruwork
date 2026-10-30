@@ -6,13 +6,15 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from .. import auth, tg
+from .. import auth, guard, tg
 from ..db import SEED, get_db, now_ms, tx
 from ..logic import (
-    BUMP_MS, CATS, MINP, PROMO_MS, PROMO_PRICE, SALE_FEE_PCT, SBP_ORDERS, SOLD_SQL, SUBS, add_coins, add_op, esc, get_coins,
-    gig_is_top, gig_out, platform_add, response_times, rub, seller_ratings, user_state,
+    BUMP_MS, CATS, DEMO_CATALOG, PREMOD_FIRST, setting, MINP, PROMO_MS, PROMO_PRICE, SALE_FEE_PCT, SBP_ORDERS, SOLD_SQL, SUBS, VISIBLE_SQL, add_op, esc, get_coins,
+    gig_is_top, gig_out, platform_add, response_times, rub, seller_level, seller_ratings, spend, user_state,
 )
+from .market import notify_searches
 from .orders import remove_cover
+from .reports import REASONS
 
 router = APIRouter(prefix="/api")
 
@@ -31,36 +33,41 @@ def meta(conn: sqlite3.Connection = Depends(get_db)):
     sellers = {
         r["name"]: [r["about"], json.loads(r["reviews_json"])]
         for r in conn.execute("SELECT * FROM sellers")
-    }
+    } if DEMO_CATALOG else {}
     return {"cats": SEED["cats"], "subs": SUBS, "minp": MINP, "syn": SEED["syn"], "sellers": sellers,
             "sbp_orders": SBP_ORDERS, "sale_fee_pct": SALE_FEE_PCT, "tg_on": bool(tg.TOKEN), "tg_bot": tg.username,
-            "promo_price": PROMO_PRICE, "bump_ms": BUMP_MS}
+            "promo_price": PROMO_PRICE, "bump_ms": BUMP_MS, "report_reasons": REASONS}
 
 
 @router.get("/gigs")
-def gigs(conn: sqlite3.Connection = Depends(get_db)):
-    # Объявления заблокированных пользователей скрыты из каталога до разблокировки.
+def gigs(user=Depends(auth.optional_user), conn: sqlite3.Connection = Depends(get_db)):
+    # Объявления заблокированных пользователей скрыты из каталога до разблокировки. Свои объявления
+    # на проверке или скрытые администратором автор получает тоже — с полями mod и mod_note.
     rows = conn.execute(
-        f"SELECT g.*, {SOLD_SQL}, u.last_seen AS owner_seen, u.verified AS owner_verified"
-        " FROM gigs g LEFT JOIN users u ON u.id = g.owner_id WHERE u.blocked_at IS NULL"
-        " ORDER BY g.owner_id IS NOT NULL, g.created_at, g.id"
+        f"SELECT g.*, {SOLD_SQL}, u.last_seen AS owner_seen, u.verified AS owner_verified, u.vacation_until AS owner_away"
+        f" FROM gigs g LEFT JOIN users u ON u.id = g.owner_id WHERE ({VISIBLE_SQL}) OR g.owner_id = ?"
+        " ORDER BY g.owner_id IS NOT NULL, g.created_at, g.id", (user["id"] if user else "",)
     ).fetchall()
-    return [with_seller(gig_out(r), r, seller_ratings(conn), response_times(conn)) for r in rows]
+    return [with_seller(conn, gig_out(r), r, seller_ratings(conn), response_times(conn)) for r in rows]
 
 
-def with_seller(g: dict, r: sqlite3.Row, ratings: dict, resp: dict) -> dict:
+def with_seller(conn: sqlite3.Connection, g: dict, r: sqlite3.Row, ratings: dict, resp: dict) -> dict:
     """Сведения о продавце для карточки: рейтинг по всем объявлениям, «в сети», время ответа, проверка."""
     g["srating"], g["srev"] = ratings.get(r["owner_id"] or "n:" + r["seller"], (0, 0))
     if r["owner_id"]:
         g["online"] = (r["owner_seen"] or 0) >= now_ms() - auth.ONLINE_MS
         g["resp"] = resp.get(r["owner_id"])
         g["verified"] = bool(r["owner_verified"])
+        g["away"] = r["owner_away"] if (r["owner_away"] or 0) > now_ms() else None
+        g["level"] = seller_level(conn, r["owner_id"])[1]
     return g
 
 
 def clean_gig(body: GigIn) -> tuple[str, str, int, str]:
     """Проверяет поля объявления. Возвращает (название, описание, цена, теги в JSON)."""
-    title, desc = esc(body.title.strip())[:200], esc(body.desc.strip())[:1000]
+    guard.check_banned(body.title, body.desc, body.tags)
+    title = esc(guard.mask_contacts(body.title.strip()))[:200]
+    desc = esc(guard.mask_contacts(body.desc.strip()))[:1000]
     base = round(body.base)
     if body.cat not in CATS or body.sub not in SUBS.get(body.cat, []):
         raise HTTPException(400, "Выберите категорию и подкатегорию")
@@ -72,16 +79,30 @@ def clean_gig(body: GigIn) -> tuple[str, str, int, str]:
     return title, desc, base, json.dumps(tags, ensure_ascii=False)
 
 
+def needs_premod(conn: sqlite3.Connection, user) -> bool:
+    """Премодерация включена в админке: первые PREMOD_FIRST объявлений непроверенного продавца ждут проверки."""
+    if setting(conn, "premod", "0") != "1" or user["verified"] or auth.staff_role(user):
+        return False
+    ok = conn.execute("SELECT count(*) FROM gigs WHERE owner_id = ? AND mod = 'ok'", (user["id"],)).fetchone()[0]
+    return ok < PREMOD_FIRST
+
+
 @router.post("/gigs")
 def create_gig(body: GigIn, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
     title, desc, base, tags = clean_gig(body)
     gig_id = f"u-{now_ms()}"
+    mod = "pending" if needs_premod(conn, user) else "ok"
     conn.execute(
         "INSERT INTO gigs(id, cat, sub, title, base, rating, rev, seller, lvl, descr, top, tags_json, owner_id,"
-        " details_json, created_at, seller_avatar) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 'Новичок', ?, 0, ?, ?, NULL, ?, ?)",
-        (gig_id, body.cat, body.sub, title, base, user["name"], desc, tags, user["id"], now_ms(), user["avatar"]),
+        " details_json, created_at, seller_avatar, mod) VALUES (?, ?, ?, ?, ?, 0, 0, ?, 'Новичок', ?, 0, ?, ?, NULL, ?, ?, ?)",
+        (gig_id, body.cat, body.sub, title, base, user["name"], desc, tags, user["id"], now_ms(), user["avatar"], mod),
     )
-    return gig_out(conn.execute(f"SELECT g.*, {SOLD_SQL} FROM gigs g WHERE g.id = ?", (gig_id,)).fetchone())
+    g = gig_out(conn.execute(f"SELECT g.*, {SOLD_SQL} FROM gigs g WHERE g.id = ?", (gig_id,)).fetchone())
+    if mod == "ok":
+        notify_searches(conn, g)
+    else:
+        guard.alert(f"Новое объявление на проверке: «{title}» от {user['name']}", "#/admin/gigs")
+    return g
 
 
 @router.put("/gigs/{gig_id}")
@@ -103,6 +124,9 @@ def update_gig(gig_id: str, body: GigIn, user=Depends(auth.require_user), conn: 
         (body.cat, body.sub, title, base, desc, tags, gig_id, user["id"]),
     ).rowcount:
         raise HTTPException(404, "Объявление не найдено")
+    # Скрытое администратором объявление после исправления снова уходит на проверку.
+    if conn.execute("UPDATE gigs SET mod = 'pending' WHERE id = ? AND mod = 'hidden'", (gig_id,)).rowcount:
+        guard.alert(f"Исправленное объявление ждёт проверки: «{title}» от {user['name']}", "#/admin/gigs")
     return gig_out(conn.execute(f"SELECT g.*, {SOLD_SQL} FROM gigs g WHERE g.id = ?", (gig_id,)).fetchone())
 
 
@@ -148,7 +172,7 @@ def promote_gig(gig_id: str, user=Depends(auth.require_user), conn: sqlite3.Conn
         if get_coins(conn, user["id"]) < PROMO_PRICE:
             raise HTTPException(400, f"Недостаточно монет: продвижение стоит {PROMO_PRICE} мон. Пополните баланс в кошельке.")
         n = now_ms()
-        add_coins(conn, user["id"], -PROMO_PRICE)
+        spend(conn, user["id"], PROMO_PRICE)
         add_op(conn, user["id"], "promo", "bal", PROMO_PRICE, "done", g["title"])
         platform_add(conn, "promo", PROMO_PRICE, user["id"], None, g["title"])
         conn.execute("UPDATE gigs SET promo_until = ?, bumped_at = ? WHERE id = ?",

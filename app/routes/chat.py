@@ -14,14 +14,15 @@ import anthropic
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
-from .. import auth
+from .. import auth, guard
 from ..db import get_db, now_ms
-from ..logic import SOLD_SQL, ai_prompt, gig_out, greeting, local_reply, notify
+from ..logic import SOLD_SQL, VISIBLE_SQL, ai_prompt, gig_out, greeting, local_reply, notify
 
 router = APIRouter(prefix="/api")
 log = logging.getLogger("ruwork.chat")
 
 VISITOR_COOKIE = "ruwork_vid"
+CHAT_RATE = (30, 60)  # сообщений в минуту от одного пользователя
 MODEL = os.environ.get("RUWORK_AI_MODEL", "claude-opus-5-5")
 # ИИ включается, только если задан ключ; иначе работают автоответы по ключевым словам.
 client = anthropic.AsyncAnthropic(timeout=30) if os.environ.get("ANTHROPIC_API_KEY") else None
@@ -48,7 +49,8 @@ def chat_owner(request: Request, response: Response, user) -> str:
 
 
 def load_gig(conn: sqlite3.Connection, gig_id: str) -> dict:
-    row = conn.execute(f"SELECT g.*, {SOLD_SQL} FROM gigs g WHERE g.id = ?", (gig_id,)).fetchone()
+    row = conn.execute(f"SELECT g.*, {SOLD_SQL} FROM gigs g LEFT JOIN users u ON u.id = g.owner_id"
+                       f" WHERE g.id = ? AND {VISIBLE_SQL}", (gig_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Кворк не найден")
     return gig_out(row)
@@ -130,6 +132,8 @@ async def send_message(gig_id: str, body: MessageIn, request: Request, response:
             raise HTTPException(401, "Войдите, чтобы написать продавцу")
         if g["owner"] == user["id"]:
             raise HTTPException(400, "Это ваше объявление: отвечайте покупателям в их диалогах")
+        guard.throttle("chat:" + user["id"], CHAT_RATE)
+        text = guard.mask_contacts(text)
         owner = "u:" + user["id"]
         conn.execute(
             "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'me', ?, ?)",
@@ -164,6 +168,8 @@ def seller_reply(gig_id: str, body: ReplyIn, user=Depends(auth.require_user),
     g = load_gig(conn, gig_id)
     if g.get("owner") != user["id"]:
         raise HTTPException(403, "Отвечать может только автор объявления")
+    guard.throttle("chat:" + user["id"], CHAT_RATE)
+    text = guard.mask_contacts(text)
     owner = "u:" + body.to
     if not conn.execute("SELECT 1 FROM chat_messages WHERE owner = ? AND gig_id = ? LIMIT 1", (owner, gig_id)).fetchone():
         raise HTTPException(404, "Диалог не найден")

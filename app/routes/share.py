@@ -21,13 +21,13 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from ..db import UPLOAD_DIR, get_db
-from ..logic import SOLD_SQL, gig_out, rub, seller_ratings
+from ..logic import SOLD_SQL, VISIBLE_SQL, gig_out, rub, seller_ratings
 from .orders import NAME_RE
 
 router = APIRouter()
 
 FONT = Path(__file__).resolve().parent.parent / "fonts" / "Inter.ttf"
-THUMB_DIRS = {"covers", "reviews"}
+THUMB_DIRS = {"covers", "reviews", "portfolio"}
 THUMB_WIDTHS = {24, 240, 480, 960}
 OG_W, OG_H = 1200, 630
 IMMUTABLE = {"Cache-Control": "public, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"}
@@ -65,7 +65,7 @@ def plain(text: str | None) -> str:
 def load_gig(conn: sqlite3.Connection, gig_id: str) -> dict:
     r = conn.execute(
         f"SELECT g.*, {SOLD_SQL} FROM gigs g LEFT JOIN users u ON u.id = g.owner_id"
-        " WHERE g.id = ? AND u.blocked_at IS NULL", (gig_id,)
+        f" WHERE g.id = ? AND {VISIBLE_SQL}", (gig_id,)
     ).fetchone()
     if not r:
         raise HTTPException(404, "Объявление не найдено")

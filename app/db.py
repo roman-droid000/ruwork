@@ -150,6 +150,99 @@ CREATE TABLE IF NOT EXISTS password_resets (
     status  TEXT NOT NULL,
     ts      INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS gig_views (
+    gig_id TEXT NOT NULL,
+    viewer TEXT NOT NULL,
+    day    INTEGER NOT NULL,
+    PRIMARY KEY (gig_id, viewer, day)
+);
+CREATE TABLE IF NOT EXISTS saved_searches (
+    id      TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    q       TEXT NOT NULL DEFAULT '',
+    cat     TEXT NOT NULL DEFAULT '',
+    sub     TEXT NOT NULL DEFAULT '',
+    max     INTEGER NOT NULL DEFAULT 100000,
+    ts      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS saved_searches_user ON saved_searches(user_id);
+CREATE TABLE IF NOT EXISTS portfolio (
+    id      TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    gig_id  TEXT,
+    name    TEXT NOT NULL,
+    title   TEXT NOT NULL DEFAULT '',
+    ts      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS portfolio_user ON portfolio(user_id, ts);
+CREATE TABLE IF NOT EXISTS requests (
+    id       TEXT PRIMARY KEY,
+    user_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    cat      TEXT NOT NULL,
+    sub      TEXT NOT NULL,
+    title    TEXT NOT NULL,
+    descr    TEXT NOT NULL,
+    budget   INTEGER NOT NULL,
+    days     INTEGER NOT NULL,
+    status   TEXT NOT NULL,
+    order_id TEXT,
+    ts       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS requests_status ON requests(status, ts);
+CREATE TABLE IF NOT EXISTS offers (
+    id         TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+    seller_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    gig_id     TEXT NOT NULL,
+    price      INTEGER NOT NULL,
+    days       INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    ts         INTEGER NOT NULL,
+    UNIQUE (request_id, seller_id)
+);
+CREATE TABLE IF NOT EXISTS reports (
+    id      TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind    TEXT NOT NULL,
+    target  TEXT NOT NULL,
+    reason  TEXT NOT NULL,
+    text    TEXT NOT NULL DEFAULT '',
+    status  TEXT NOT NULL,
+    ts      INTEGER NOT NULL,
+    UNIQUE (user_id, kind, target)
+);
+CREATE INDEX IF NOT EXISTS reports_status ON reports(status, ts);
+CREATE TABLE IF NOT EXISTS admin_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         INTEGER NOT NULL,
+    staff_id   TEXT NOT NULL,
+    staff_name TEXT NOT NULL,
+    action     TEXT NOT NULL,
+    user_id    TEXT,
+    target     TEXT NOT NULL DEFAULT '',
+    coins      INTEGER,
+    text       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS admin_log_user ON admin_log(user_id, ts);
+CREATE TABLE IF NOT EXISTS user_ips (
+    user_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    ip       TEXT NOT NULL,
+    first_ts INTEGER NOT NULL,
+    last_ts  INTEGER NOT NULL,
+    PRIMARY KEY (user_id, ip)
+);
+CREATE INDEX IF NOT EXISTS user_ips_ip ON user_ips(ip);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS errors (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts   INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    msg  TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS tg_support (
     admin_msg   INTEGER PRIMARY KEY,
     client_chat INTEGER NOT NULL,
@@ -291,7 +384,64 @@ def init_db() -> None:
         # Миграция: значок «Проверенный продавец», который ставит администратор.
         if "verified" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
             conn.execute("ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
-        for sub in ("covers", "results", "avatars", "reviews"):
+        # Миграция: баланс делится на аванс (пополнения, возвращаются только на исходный платёж) и заработок
+        # (продажи и компенсации, его можно вывести). Старым балансам заработок — доход минус выводы, не больше баланса.
+        if "earned" not in {r[1] for r in conn.execute("PRAGMA table_info(wallets)")}:
+            conn.execute("ALTER TABLE wallets ADD COLUMN earned INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                "UPDATE wallets SET earned = max(0, min(coins, coalesce((SELECT sum(CASE WHEN t IN ('sale', 'comp')"
+                " THEN coins ELSE -coins END) FROM wallet_ops o WHERE o.user_id = wallets.user_id"
+                " AND (t IN ('sale', 'comp') AND status = 'done' OR t = 'wd' AND status IN ('pending', 'done'))), 0)))"
+            )
+        # Миграция: сколько заказа оплачено из аванса — эта часть при отмене возвращается в аванс, остальное в заработок.
+        if "paid_adv" not in {r[1] for r in conn.execute("PRAGMA table_info(orders)")}:
+            conn.execute("ALTER TABLE orders ADD COLUMN paid_adv INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE orders SET paid_adv = amount WHERE method = 'bal'")
+        # Миграция: возврат на карту (t = 'rf') ссылается на пополнение, к платежу которого он делается.
+        if "src" not in {r[1] for r in conn.execute("PRAGMA table_info(wallet_ops)")}:
+            conn.execute("ALTER TABLE wallet_ops ADD COLUMN src TEXT")
+        # Миграция: срок и правки заказа (по тарифу на момент покупки или из отклика на бирже), продление срока
+        # по согласию покупателя и время первой сдачи результата (по нему считается «сдано в срок»).
+        ocols = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
+        if "days" not in ocols:
+            conn.execute("ALTER TABLE orders ADD COLUMN days INTEGER NOT NULL DEFAULT 5")
+            conn.execute("ALTER TABLE orders ADD COLUMN revs INTEGER NOT NULL DEFAULT 3")
+            conn.execute("ALTER TABLE orders ADD COLUMN revs_used INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE orders ADD COLUMN extra_days INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE orders ADD COLUMN ext_days INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE orders ADD COLUMN ext_reason TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE orders ADD COLUMN delivered_at INTEGER")
+            conn.execute("UPDATE orders SET days = 3 WHERE tier = 1")
+            conn.execute("UPDATE orders SET delivered_at = reviewed_at WHERE reviewed_at IS NOT NULL")
+        # Миграция: режим «В отпуске» — до какого времени продавец не принимает заказы.
+        if "vacation_until" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN vacation_until INTEGER")
+            conn.execute("ALTER TABLE users ADD COLUMN vacation_note TEXT NOT NULL DEFAULT ''")
+        # Миграция: сброс пароля кнопкой из Telegram (sha256 одноразового токена).
+        if "token" not in {r[1] for r in conn.execute("PRAGMA table_info(password_resets)")}:
+            conn.execute("ALTER TABLE password_resets ADD COLUMN token TEXT")
+        # Миграция: напоминания продавцу о сроке (1 — «остались сутки», 2 — «срок прошёл»).
+        if "dl_reminded" not in {r[1] for r in conn.execute("PRAGMA table_info(orders)")}:
+            conn.execute("ALTER TABLE orders ADD COLUMN dl_reminded INTEGER NOT NULL DEFAULT 0")
+        # Миграция: роль сотрудника (moder), временная блокировка до blocked_until.
+        ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+        if "role" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE users ADD COLUMN blocked_until INTEGER")
+        # Миграция: полный телефон вывода (для администратора и проверки совпадений между аккаунтами).
+        if "phone" not in {r[1] for r in conn.execute("PRAGMA table_info(wallet_ops)")}:
+            conn.execute("ALTER TABLE wallet_ops ADD COLUMN phone TEXT")
+        # Миграция: модерация объявлений — ok (в каталоге), pending (ждёт проверки), hidden (скрыто с причиной).
+        if "mod" not in {r[1] for r in conn.execute("PRAGMA table_info(gigs)")}:
+            conn.execute("ALTER TABLE gigs ADD COLUMN mod TEXT NOT NULL DEFAULT 'ok'")
+            conn.execute("ALTER TABLE gigs ADD COLUMN mod_note TEXT NOT NULL DEFAULT ''")
+        # Миграция: второй фактор входа в админку (код из Telegram) — на уровне сессии.
+        if "mfa_at" not in {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}:
+            conn.execute("ALTER TABLE sessions ADD COLUMN mfa_at INTEGER")
+            conn.execute("ALTER TABLE sessions ADD COLUMN mfa_code TEXT")
+            conn.execute("ALTER TABLE sessions ADD COLUMN mfa_sent INTEGER")
+            conn.execute("ALTER TABLE sessions ADD COLUMN mfa_tries INTEGER NOT NULL DEFAULT 0")
+        for sub in ("covers", "results", "avatars", "reviews", "portfolio"):
             (UPLOAD_DIR / sub).mkdir(parents=True, exist_ok=True)
         with tx(conn):
             for name, (about, reviews) in SEED["sellers"].items():

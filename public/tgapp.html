@@ -134,8 +134,9 @@ const STAGE = {"Ожидает подтверждения": 0, "В работе"
 const ACTIVE = STATUSES.slice(0, 4);
 const FILTERS = [["all", "Все"], ["active", "Активные"], ["review", "На проверке"], ["dispute", "Споры"], ["closed", "Завершённые"]];
 const DISPUTE_RESULT = {seller: "оплата продавцу", buyer: "полный возврат покупателю", split: "сумма разделена пополам", closed: "покупатель закрыл спор"};
-const OPS = {dep: ["Пополнение", "➕", 1], wd: ["Вывод", "💸", -1], pay: ["Оплата заказа", "🛒", -1], ref: ["Возврат", "↩️", 1],
-             sale: ["Продажа", "💼", 1], comp: ["Компенсация за отмену", "🤝", 1], promo: ["Продвижение", "🚀", -1]};
+const OPS = {dep: ["Пополнение", "➕", 1], wd: ["Вывод заработка", "💸", -1], rf: ["Возврат на карту", "💳", -1], pay: ["Оплата заказа", "🛒", -1], ref: ["Возврат", "↩️", 1],
+             sale: ["Продажа", "💼", 1], comp: ["Компенсация за отмену", "🤝", 1], promo: ["Продвижение", "🚀", -1],
+             adj_in: ["Начисление от администрации", "🎁", 1], adj_out: ["Списание администрацией", "🧾", -1]};
 const MONTHS = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
 
 const S = {data: null, tab: "buy", q: {buy: "", sell: ""}, f: {buy: "all", sell: "all"}, view: "list", order: null,
@@ -347,8 +348,8 @@ function opRow(op) {
 }
 function walletView() {
   const w = S.data.wallet, pending = w.ops.filter(o => o.status === "pending");
-  return `<div class="bal"><small>Баланс</small><b>${nf(w.coins)} монет</b><span style="opacity:.85;font-size:13px">1 монета = 1 ₽ · оплата заказов и вывод</span>
-    <div class="acts"><button class="btn" data-link="/#/dashboard/wallet">➕ Пополнить</button><button class="btn" data-link="/#/dashboard/wallet">💸 Вывести</button></div></div>
+  return `<div class="bal"><small>Баланс</small><b>${nf(w.coins)} монет</b><span style="opacity:.85;font-size:13px">Пополнено ${nf(w.adv || 0)} · заработано ${nf(w.earned || 0)}</span>
+    <div class="acts"><button class="btn" data-link="/#/dashboard/wallet">➕ Пополнить</button><button class="btn" data-link="/#/dashboard/wallet">${w.earned > 0 ? "💸 Вывести" : "💳 Вернуть"}</button></div></div>
     ${pending.length ? `<div class="sec"><h2>⏳ Заявки в обработке<span>${pending.length}</span></h2>${pending.map(opRow).join("")}
       <p class="hint">Заявки подтверждает администратор. Если заявка висит долго — напишите в поддержку.</p></div>` : ""}
     <div class="sec"><h2>История операций</h2>${w.ops.filter(o => o.status !== "pending").slice(0, 50).map(opRow).join("") || `<p class="hint">Операций пока нет.</p>`}</div>`;
@@ -502,7 +503,7 @@ document.addEventListener("click", async e => {
   if (t.dataset.star) { S.stars = +t.dataset.star; document.querySelectorAll("[data-star]").forEach(b => b.classList.toggle("on", +b.dataset.star <= S.stars)); return }
   if (t.dataset.copy) { try { await navigator.clipboard.writeText(t.dataset.copy); toast("Номер скопирован") } catch (x) { toast(t.dataset.copy) } return }
   if (t.dataset.cancelOp) {
-    if (!await ask("Отменить заявку? Если это вывод, монеты вернутся на баланс.")) return;
+    if (!await ask("Отменить заявку? Если это вывод или возврат на карту, монеты вернутся на баланс.")) return;
     try { const r = await api("POST", `/api/tgapp/ops/${encodeURIComponent(t.dataset.cancelOp)}/cancel`); S.data.wallet = r.wallet; haptic("success"); toast("Заявка отменена"); render(); load() }
     catch (x) { haptic("error"); toast(x.message) }
     return;

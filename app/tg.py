@@ -57,12 +57,17 @@ def setup() -> None:
 
 def send(chat_id: int | None, text: str, link: str = "") -> None:
     """Отправить сообщение в фоне, чтобы запрос пользователя не ждал Telegram."""
+    send_button(chat_id, text, "Открыть на RUWORK", f"{PUBLIC_URL}/{link}" if link else "")
+
+
+def send_button(chat_id: int | None, text: str, label: str, url: str) -> None:
+    """Сообщение с одной кнопкой-ссылкой (без кнопки, если url пустой)."""
     if not (TOKEN and chat_id):
         return
     # Тексты уведомлений хранятся экранированными для innerHTML; Telegram получает обычный текст.
     payload = {"chat_id": chat_id, "text": html.unescape(text)[:4000], "disable_web_page_preview": True}
-    if link:
-        payload["reply_markup"] = {"inline_keyboard": [[{"text": "Открыть на RUWORK", "url": f"{PUBLIC_URL}/{link}"}]]}
+    if url:
+        payload["reply_markup"] = {"inline_keyboard": [[{"text": label, "url": url}]]}
 
     def run():
         try:
@@ -71,6 +76,21 @@ def send(chat_id: int | None, text: str, link: str = "") -> None:
             log.warning("Telegram: не удалось отправить сообщение: %s", e)
 
     threading.Thread(target=run, daemon=True).start()
+
+
+def send_file(chat_id: int, path, caption: str = "") -> None:
+    """Отправить файл документом (до 50 МБ — ограничение Bot API). Вызывается из фонового потока, ошибки — наружу."""
+    boundary = secrets.token_hex(16)
+    parts = []
+    for k, v in (("chat_id", str(chat_id)), ("caption", caption[:1000])):
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{path.name}"\r\n'
+                 "Content-Type: application/octet-stream\r\n\r\n".encode() + path.read_bytes() + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    req = urllib.request.Request(f"https://api.telegram.org/bot{TOKEN}/sendDocument", data=b"".join(parts),
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        r.read()
 
 
 LINK_CODE_TTL = 15 * 60  # ссылка «Подключить Telegram» действует 15 минут

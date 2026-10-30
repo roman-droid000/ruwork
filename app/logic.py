@@ -15,6 +15,10 @@ RATE = 250  # рублей за 1 TON
 CONFIRM_MS = 60_000  # «Ожидает подтверждения» → «В работе»
 WORK_MS = 86_400_000  # «В работе» → «Выполнен»
 SBP_ORDERS = False  # оплата заказов через СБП временно отключена; True — включить обратно
+# Встроенный демо-каталог (услуги g-… из seed.json с ИИ-ответчиком). Выключен: покупатели видят только
+# объявления настоящих продавцов. Услуги остаются в базе, True возвращает их в каталог.
+DEMO_CATALOG = False
+PREMOD_FIRST = 3  # при включённой премодерации столько первых объявлений продавца проверяет администрация
 REFUND_WORK_PCT = 90  # возврат при отмене заказа «В работе»; до подтверждения возвращается 100 %
 SALE_FEE_PCT = 5  # комиссия платформы с каждой завершённой продажи
 PLATFORM_CANCEL_PCT = 5  # из удержанных 10 % платформе; остальное — продавцу за начатую работу
@@ -38,6 +42,9 @@ PROMO_MS = 86_400_000  # платное продвижение длится су
 PROMO_PRICE = 99  # цена продвижения в монетах
 RESP_WINDOW_MS = 30 * 86_400_000  # время ответа продавца считается по сообщениям за 30 дней
 RESP_MIN_SAMPLES = 3  # меньше ответов — время ответа не показываем
+DAY_MS = 86_400_000
+EXT_MAX_DAYS = 7  # на сколько дней продавец может попросить продлить срок за один запрос
+VACATION_MAX_MS = 90 * DAY_MS
 
 # (название, множитель цены, срок в днях, правок, что входит). Название тарифа сохраняется в заказе
 # (orders.tier_name), поэтому старые заказы показывают свой тариф и после смены этого списка.
@@ -92,6 +99,8 @@ def gig_out(row: sqlite3.Row) -> dict:
     if row["owner_id"]:
         g["mine"] = True
         g["owner"] = row["owner_id"]
+    if row["mod"] != "ok":
+        g["mod"], g["mod_note"] = row["mod"], row["mod_note"]
     return g
 
 
@@ -146,6 +155,19 @@ def notify(conn: sqlite3.Connection, user_id, kind: str, text: str, link: str = 
                  (user_id, kind, text[:300], link, now_ms()))
 
 
+def audit(conn: sqlite3.Connection, staff, action: str, text: str, user_id=None, target: str = "", coins=None) -> None:
+    """Журнал действий администрации: кто, когда, что сделал, с кем и на какую сумму."""
+    conn.execute(
+        "INSERT INTO admin_log(ts, staff_id, staff_name, action, user_id, target, coins, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (now_ms(), staff["id"], staff["name"], action, user_id, target, coins, text[:500]),
+    )
+
+
+def setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
 def platform_add(conn: sqlite3.Connection, kind: str, coins: int, user_id=None, order_id=None, note="") -> None:
     """Поступление на баланс платформы: комиссия за вывод (wd_fee) или доля удержания при отмене (cancel)."""
     if coins > 0:
@@ -173,7 +195,7 @@ def complete_order(conn: sqlite3.Connection, o: sqlite3.Row, auto: bool = False,
     fee = sale_fee(o["amount"])
     net = o["amount"] - fee
     if paid:
-        add_coins(conn, o["seller_id"], net)
+        add_coins(conn, o["seller_id"], net, net)
         add_op(conn, o["seller_id"], "sale", "bal", net, "done", f"{o['num']} · {o['title']}", fee)
         platform_add(conn, "sale_fee", fee, o["seller_id"], o["id"], f"{o['num']} · {o['title']}")
     who = ("Спор решён в пользу продавца" if by_admin else
@@ -214,26 +236,50 @@ def sales(conn: sqlite3.Connection, user_id: str) -> list[dict]:
 
 
 def get_coins(conn: sqlite3.Connection, user_id: str) -> int:
-    row = conn.execute("SELECT coins FROM wallets WHERE user_id = ?", (user_id,)).fetchone()
-    return row["coins"] if row else 0
+    return get_wallet(conn, user_id)[0]
 
 
-def add_coins(conn: sqlite3.Connection, user_id: str, delta: int) -> None:
+def get_wallet(conn: sqlite3.Connection, user_id: str) -> tuple[int, int]:
+    """(весь баланс, заработок). Разница — аванс: пополнения, которые возвращаются только на исходный платёж."""
+    row = conn.execute("SELECT coins, earned FROM wallets WHERE user_id = ?", (user_id,)).fetchone()
+    return (row["coins"], row["earned"]) if row else (0, 0)
+
+
+def add_coins(conn: sqlite3.Connection, user_id: str, delta: int, earned: int = 0) -> None:
+    """delta — изменение всего баланса, earned — какая его часть приходится на заработок."""
     conn.execute(
-        "INSERT INTO wallets(user_id, coins) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET coins = coins + excluded.coins",
-        (user_id, delta),
+        "INSERT INTO wallets(user_id, coins, earned) VALUES (?, ?, ?) ON CONFLICT(user_id)"
+        " DO UPDATE SET coins = coins + excluded.coins, earned = earned + excluded.earned",
+        (user_id, delta, earned),
     )
 
 
-def add_op(conn, user_id, t, method, coins, status, dest="", fee=0) -> None:
+def spend(conn: sqlite3.Connection, user_id: str, amount: int) -> int:
+    """Списывает оплату: сначала из аванса, потом из заработка. Возвращает часть, взятую из аванса."""
+    coins, earned = get_wallet(conn, user_id)
+    adv = min(amount, max(0, coins - earned))
+    add_coins(conn, user_id, -amount, -(amount - adv))
+    return adv
+
+
+def refund_back(conn: sqlite3.Connection, user_id: str, refund: int, paid_adv: int) -> None:
+    """Возврат за заказ на баланс: в аванс — не больше, чем из него было оплачено, остальное — в заработок."""
+    adv = min(refund, paid_adv)
+    add_coins(conn, user_id, refund, refund - adv)
+
+
+def add_op(conn, user_id, t, method, coins, status, dest="", fee=0) -> str:
+    op_id = new_id()
     conn.execute(
         "INSERT INTO wallet_ops(id, user_id, t, method, coins, fee, status, dest, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (new_id(), user_id, t, method, coins, fee, status, dest, now_ms()),
+        (op_id, user_id, t, method, coins, fee, status, dest, now_ms()),
     )
+    return op_id
 
 
 def user_state(conn: sqlite3.Connection, user_id: str) -> dict:
     tick(conn, user_id)
+    coins, earned = get_wallet(conn, user_id)
     orders = conn.execute(
         "SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC, rowid DESC", (user_id,)
     ).fetchall()
@@ -251,11 +297,13 @@ def user_state(conn: sqlite3.Connection, user_id: str) -> dict:
     ).fetchall()
     return {
         "orders": [order_row(o) for o in orders],
-        "wallet": {"coins": get_coins(conn, user_id), "ops": [dict(o) for o in ops]},
+        "wallet": {"coins": coins, "earned": earned, "adv": coins - earned, "ops": [dict(o) for o in ops]},
         "inbox": {r[0]: r[1] for r in inbox},
         "sales": sales(conn, user_id),
         "favs": [r[0] for r in conn.execute("SELECT gig_id FROM favorites WHERE user_id = ? ORDER BY ts DESC", (user_id,))],
         "notes": unread_notes(conn, user_id),
+        "searches": [dict(r) for r in conn.execute(
+            "SELECT id, q, cat, sub, max, ts FROM saved_searches WHERE user_id = ? ORDER BY ts DESC", (user_id,))],
     }
 
 
@@ -314,10 +362,96 @@ SOLD_SQL = (f"(SELECT COUNT(*) FROM orders o WHERE o.gig_id = g.id AND o.status 
             f" (SELECT COUNT(*) FROM orders o WHERE o.seller_id = g.owner_id AND o.status = '{ST_DONE}') AS seller_sold")
 
 
+# Условие «объявление видно в каталоге» для запросов с gigs g LEFT JOIN users u ON u.id = g.owner_id.
+# Объявление на модерации (mod = 'pending') или скрытое администратором ('hidden') видно только автору.
+VISIBLE_SQL = "u.blocked_at IS NULL AND g.mod = 'ok'" + ("" if DEMO_CATALOG else " AND g.owner_id IS NOT NULL")
+
+
 def gig_is_top(conn: sqlite3.Connection, gig_id: str) -> bool:
     """Объявление сейчас в «ТОП» (вручную или по числу выполненных заказов)."""
     row = conn.execute(f"SELECT g.*, {SOLD_SQL} FROM gigs g WHERE g.id = ?", (gig_id,)).fetchone()
     return bool(row) and gig_out(row)["top"]
+
+
+def deadline(o) -> int | None:
+    """Когда заказ нужно сдать: от перехода «В работе» + срок тарифа (или отклика) + согласованные продления."""
+    if not o["started_at"]:
+        return None
+    return o["started_at"] + (o["days"] + o["extra_days"]) * DAY_MS
+
+
+# Уровни продавца: (название, выполнено заказов, отзывов, рейтинг, сдано в срок %, споров не больше %, ответ не дольше мс).
+LEVELS = [
+    ("Новичок", 0, 0, 0, 0, 100, None),
+    ("Уровень 1", 5, 0, 4.5, 80, 10, None),
+    ("Уровень 2", 25, 5, 4.7, 90, 5, 6 * 3_600_000),
+    ("Профи", 100, 20, 4.8, 95, 3, 2 * 3_600_000),
+]
+_lvl_cache: tuple[int, dict] = (0, {})
+
+
+def seller_stats(conn: sqlite3.Connection) -> dict[str, dict]:
+    """Показатели продавцов по их заказам: выполнено, доля сданных в срок, доля споров. Считается раз в минуту."""
+    global _lvl_cache
+    n = now_ms()
+    if n - _lvl_cache[0] < 60_000:
+        return _lvl_cache[1]
+    out: dict[str, dict] = {}
+    rows = conn.execute(
+        "SELECT seller_id, status, started_at, days, extra_days, delivered_at, dispute_at FROM orders"
+        " WHERE seller_id IS NOT NULL AND status IN (?, ?)", (ST_DONE, ST_CANCEL),
+    ).fetchall()
+    for r in rows:
+        st = out.setdefault(r["seller_id"], {"done": 0, "closed": 0, "disputes": 0, "timed": 0, "on_time": 0})
+        st["closed"] += 1
+        st["disputes"] += r["dispute_at"] is not None
+        if r["status"] == ST_DONE:
+            st["done"] += 1
+            if r["delivered_at"] and r["started_at"]:
+                st["timed"] += 1
+                st["on_time"] += r["delivered_at"] <= deadline(r)
+    _lvl_cache = (n, out)
+    return out
+
+
+def seller_level(conn: sqlite3.Connection, user_id: str, full: bool = False):
+    """Уровень продавца (индекс и название). full=True — ещё и условия следующего уровня с текущими значениями."""
+    st = seller_stats(conn).get(user_id, {"done": 0, "closed": 0, "disputes": 0, "timed": 0, "on_time": 0})
+    rating, rev = seller_ratings(conn).get(user_id, (0, 0))
+    resp = response_times(conn).get(user_id)
+    on_time = round(100 * st["on_time"] / st["timed"]) if st["timed"] else 100
+    disputes = round(100 * st["disputes"] / st["closed"]) if st["closed"] else 0
+
+    def checks(lv):
+        _, done, revs, rate, ot, dsp, rsp = lv
+        c = [("Выполнено заказов", f"{st['done']} из {done}", st["done"] >= done)]
+        if revs:
+            c.append(("Отзывов", f"{rev} из {revs}", rev >= revs))
+        if rate:
+            # Без обязательных отзывов (уровень 1) рейтинг проверяется, только если отзывы уже есть.
+            ok = rating >= rate if rev else not revs
+            c.append((f"Рейтинг от {rate}", str(rating) if rev else "нет отзывов", ok))
+        if ot:
+            c.append((f"Сдано в срок от {ot} %", f"{on_time} %", on_time >= ot))
+        if dsp < 100:
+            c.append((f"Споров не больше {dsp} %", f"{disputes} %", disputes <= dsp))
+        if rsp:
+            c.append((f"Отвечает быстрее {rsp // 3_600_000} ч", f"{round(resp / 3_600_000, 1)} ч" if resp else "мало данных",
+                      bool(resp) and resp <= rsp))
+        return c
+
+    idx = 0
+    for i, lv in enumerate(LEVELS[1:], 1):
+        if all(ok for _, _, ok in checks(lv)):
+            idx = i
+        else:
+            break
+    if not full:
+        return idx, LEVELS[idx][0]
+    nxt = LEVELS[idx + 1] if idx + 1 < len(LEVELS) else None
+    return {"idx": idx, "name": LEVELS[idx][0], "next": nxt[0] if nxt else None,
+            "checks": [{"label": a, "value": b, "ok": c} for a, b, c in checks(nxt)] if nxt else [],
+            "stats": {"done": st["done"], "on_time": on_time, "disputes": disputes, "rating": rating, "rev": rev, "resp": resp}}
 
 
 def resolve_dispute(conn: sqlite3.Connection, o: sqlite3.Row, act: str) -> None:
@@ -340,10 +474,10 @@ def resolve_dispute(conn: sqlite3.Connection, o: sqlite3.Row, act: str) -> None:
     fee = sale_fee(part) if part else 0
     note = f"{o['num']} · {o['title']}"
     if bal:
-        add_coins(conn, o["user_id"], refund)
+        refund_back(conn, o["user_id"], refund, o["paid_adv"])
         add_op(conn, o["user_id"], "ref", "bal", refund, "done", note)
         if part and o["seller_id"]:
-            add_coins(conn, o["seller_id"], part - fee)
+            add_coins(conn, o["seller_id"], part - fee, part - fee)
             add_op(conn, o["seller_id"], "sale", "bal", part - fee, "done", note, fee)
             platform_add(conn, "sale_fee", fee, o["seller_id"], o["id"], note)
     if act == "buyer":

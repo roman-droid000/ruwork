@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .. import auth, tg
+from ..guard import hit, limited, throttle
 from ..db import ROOT, get_db, now_ms, tx
 from ..logic import AUTO_CONFIRM_MS, CONFIRM_MS, ST_DONE, TIERS, notify, tick, user_state
 from . import chat, money, orders as order_routes, reviews
@@ -43,7 +44,6 @@ LOGIN_PER_TG = (5, 900)  # неудачных входов с одного Teleg
 LOGIN_PER_EMAIL = (10, 900)  # неудачных входов в один аккаунт с любых Telegram — против перебора пароля
 CHAT_RATE = (15, 60)  # сообщений в чат заказа в минуту
 ACTION_RATE = (20, 60)  # действий с заказами и заявками в минуту
-hits: dict[str, list[float]] = {}
 DUMMY_SALT = b"\0" * 16  # хэш для несуществующего email: время ответа не выдаёт, есть ли аккаунт
 
 
@@ -54,30 +54,6 @@ class LoginIn(BaseModel):
 
 class TextIn(BaseModel):
     text: str = Field(max_length=4000)
-
-
-def limited(key: str, limit: tuple[int, int]) -> bool:
-    count, window = limit
-    now = time.time()
-    recent = [t for t in hits.get(key, []) if now - t < window]
-    if recent:
-        hits[key] = recent
-    else:
-        hits.pop(key, None)
-    if len(hits) > 50_000:  # старые ключи чистим, чтобы словарь не рос бесконечно
-        for k in [k for k, v in hits.items() if now - v[-1] > 3600]:
-            del hits[k]
-    return len(recent) >= count
-
-
-def hit(key: str) -> None:
-    hits.setdefault(key, []).append(time.time())
-
-
-def throttle(key: str, limit: tuple[int, int]) -> None:
-    if limited(key, limit):
-        raise HTTPException(429, "Слишком часто — подождите немного и попробуйте снова")
-    hit(key)
 
 
 def check_init_data(init_data: str) -> int:
@@ -213,6 +189,8 @@ def login(body: LoginIn, chat_id: int = Depends(tg_id), conn: sqlite3.Connection
         raise HTTPException(400, "Неверный email или пароль")
     if user["blocked_at"] is not None:
         raise HTTPException(403, auth.blocked_message(user))
+    if auth.staff_role(user) and user["tg_chat"] and user["tg_chat"] != chat_id:
+        raise HTTPException(403, "Этот аккаунт уже привязан к другому Telegram")
     # Владелец должен узнать о новой привязке. notify пишет в колокольчик на сайте и дублирует в Telegram,
     # привязанный сейчас, — поэтому вызываем до перепривязки: предупреждение получит прежний Telegram.
     if user["tg_chat"] != chat_id:
