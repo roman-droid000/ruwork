@@ -104,7 +104,7 @@ def start(tmp: Path, db: Path, log: str, **extra) -> tuple[subprocess.Popen, str
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="ruwork-e2e-"))
     db = tmp / "e2e.db"
-    for log, extra, phase in (("server.log", {}, run), ("server-mfa.log", {"RUWORK_TG_TOKEN": "0:e2e-fake"}, run_mfa)):
+    for log, extra, phase in (("server.log", {}, run), ("server-mfa.log", {"RUWORK_TG_TOKEN": "0:e2e-fake", "RUWORK_TG_BOT": "e2e_bot"}, run_mfa)):
         server, base = start(tmp, db, log, **extra)
         try:
             phase(base, db, tmp)
@@ -360,10 +360,43 @@ def run(base: str, db: Path, tmp: Path) -> None:
     check("в /api/state у модератора staff=moder", buyer.ok("GET", "/api/state")["me"].get("staff") == "moder")
     check("обычный пользователь в админку не попадает", seller.call("GET", "/api/admin/attention")[0] == 403)
 
+    step("20. Удаление аккаунта")
+    st = seller.ok("GET", "/api/me/delete")
+    check("незавершённая продажа мешает удалению", any("продажи" in b for b in st["blockers"]), st)
+    code, err = seller.call("POST", "/api/me/delete", {"password": pw})
+    check("с незавершённым заказом удалить нельзя", code == 400 and "нельзя" in str(err), err)
+    tw = Client(base, "10.0.0.9")
+    tw.ok("POST", "/api/auth/login", {"email": f"t{sfx}@e2e.test", "password": pw})
+    check("пароль обязателен", tw.call("POST", "/api/me/delete", {"password": "wrong-pass1"})[0] == 400)
+    tw.ok("POST", "/api/me/delete", {"password": pw})
+    check("после удаления сессия закрыта", tw.ok("GET", "/api/state")["me"] is None)
+    code, _ = Client(base, "10.0.0.10").call("POST", "/api/auth/login", {"email": f"t{sfx}@e2e.test", "password": pw})
+    check("войти в удалённый аккаунт нельзя", code == 400, code)
+    check("объявления удалённого аккаунта удалены", all(g["id"] != g2["id"] for g in admin.ok("GET", "/api/admin/gigs")))
+    du = next(u for u in admin.ok("GET", "/api/admin/users") if u["id"] == me_t["id"])
+    check("аккаунт обезличен", du["name"].startswith("Удалённый аккаунт") and "e2e" not in du["email"] and du["blocked_at"], du)
+    check("публичный профиль недоступен", buyer.call("GET", f"/api/sellers/{me_t['id']}")[0] == 404)
+    check("администратор не может «разблокировать» удалённый", admin.call("POST", f"/api/admin/users/{me_t['id']}/unblock")[0] == 400)
+    rich = Client(base, "10.0.0.11")
+    rich.ok("POST", "/api/auth/register", {"name": "Богач" + sfx, "email": f"r{sfx}@e2e.test", "password": pw,
+                                           "password2": pw, "terms": True})
+    rich.ok("POST", "/api/wallet/deposit", {"amount": 300})
+    check("заявка в обработке мешает удалению", any("заявки" in b for b in rich.ok("GET", "/api/me/delete")["blockers"]))
+    dep = next(o for o in admin.ok("GET", "/api/admin/ops") if o["status"] == "pending" and o["t"] == "dep")
+    admin.ok("POST", f"/api/admin/ops/{dep['id']}/approve")
+    code, err = rich.call("POST", "/api/me/delete", {"password": pw})
+    check("остаток на балансе требует согласия", code == 400 and "300" in str(err), err)
+    before = admin.ok("GET", "/api/admin/platform")["coins"]
+    rich.ok("POST", "/api/me/delete", {"password": pw, "forfeit": True})
+    check("сгоревший остаток учтён на балансе платформы", admin.ok("GET", "/api/admin/platform")["coins"] == before + 300)
+    check("сверка после удаления — без расхождений", admin.ok("GET", "/api/admin/reconcile")["bad"] == [])
+    check("аккаунт владельца удалить нельзя", admin.call("POST", "/api/me/delete", {"password": ADMIN_PASSWORD})[0] == 400)
+
 
 def run_mfa(base: str, db: Path, tmp: Path) -> None:
     """Тот же сервер, но с токеном бота: админ-панель требует код из Telegram (бот ненастоящий, код пишем в базу)."""
     import hashlib
+    import json
 
     step("18. Второй фактор входа в админку")
     admin = Client(base, "10.0.0.3")
@@ -385,11 +418,114 @@ def run_mfa(base: str, db: Path, tmp: Path) -> None:
     check("с кодом — админка открыта", admin.call("GET", "/api/admin/attention")[0] == 200)
     check("Telegram сотрудника с сайта не отвязать", admin.call("DELETE", "/api/me/telegram")[0] == 403)
     check("и не перепривязать", admin.call("POST", "/api/me/telegram")[0] == 403)
+    def code_login(cl: Client, login: str, password: str, user_id: str) -> dict:
+        """Вход с привязанным Telegram: пароль → код (код подставляем в базу, бот ненастоящий)."""
+        r = cl.ok("POST", "/api/auth/login", {"email": login, "password": password})
+        if r.get("need_code"):
+            c.execute("UPDATE login_codes SET code = ? WHERE user_id = ?",
+                      (hashlib.sha256(b"login:777777").hexdigest(), user_id))
+            c.commit()
+        return r
+
     other = Client(base, "10.0.0.3")
-    other.ok("POST", "/api/auth/login", {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
-    check("новая сессия с тем же паролем снова требует код", other.call("GET", "/api/admin/users")[0] == 428)
+    r = other.ok("POST", "/api/auth/login", {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
+    check("с привязанным Telegram пароля мало — нужен код", r.get("need_code") and r.get("ticket"), r)
+    check("до ввода кода сессии нет", other.ok("GET", "/api/state")["me"] is None)
+    c.execute("UPDATE login_codes SET code = ? WHERE user_id = 'u-admin'", (hashlib.sha256(b"login:777777").hexdigest(),))
+    c.commit()
+    code, err = other.call("POST", "/api/auth/login/code", {"ticket": r["ticket"], "code": "000000"})
+    check("неверный код входа отклонён", code == 400 and "Неверный код" in str(err), err)
+    code, _ = Client(base, "10.0.0.3").call("POST", "/api/auth/login/code", {"ticket": "чужой", "code": "777777"})
+    check("без своего билета код не подходит", code == 400, code)
+    other.ok("POST", "/api/auth/login/code", {"ticket": r["ticket"], "code": "777777"})
+    check("после кода — вход выполнен", other.ok("GET", "/api/state")["me"]["admin"] is True)
+    check("код входа сразу открывает админку (второй раз код не нужен)", other.call("GET", "/api/admin/users")[0] == 200)
+    code, _ = other.call("POST", "/api/auth/login/code", {"ticket": r["ticket"], "code": "777777"})
+    check("билет одноразовый", code == 400, code)
     c.execute("UPDATE users SET tg_chat = NULL WHERE email = ?", (ADMIN_EMAIL,))
     c.commit()
+
+    step("19. Регистрация через Telegram")
+    secret = hashlib.sha256(b"ruwork-tg:0:e2e-fake").hexdigest()[:40]
+    reg_hash = lambda t: hashlib.sha256(("ruwork-reg:" + t).encode()).hexdigest()
+
+    def bot(chat: int, **msg):
+        req = urllib.request.Request(f"{base}/api/tg/{secret}", method="POST", headers={
+            "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": secret},
+            data=json.dumps({"message": {"message_id": 1, "chat": {"id": chat, "type": "private"},
+                                         "from": {"id": chat}, **msg}}).encode())
+        urllib.request.urlopen(req, timeout=60).read()
+
+    meta = Client(base, "10.0.1.1").ok("GET", "/api/meta")
+    check("сайт сообщает: регистрация через Telegram", meta.get("reg_tg") is True)
+    new = Client(base, "10.0.1.1")
+    pw = "Passw0rd-tg"
+    code, err = new.call("POST", "/api/auth/register", {"name": "ТГшник", "email": "x@e2e.test", "password": pw,
+                                                         "password2": pw, "terms": True})
+    check("регистрация по email закрыта, нужен код", code == 400 and "код" in str(err).lower(), err)
+    code, err = new.call("POST", "/api/auth/register", {"name": "ТГшник", "password": "short", "password2": "short",
+                                                         "terms": True, "check_only": True})
+    check("проверка до окна с кодом: слабый пароль отклонён", code == 400 and "Пароль" in str(err), err)
+    ok = new.ok("POST", "/api/auth/register", {"name": "ТГшник", "password": pw, "password2": pw, "terms": True,
+                                                "check_only": True})
+    check("проверка до окна с кодом: аккаунт ещё не создан", ok == {"ok": True}
+          and new.ok("GET", "/api/state")["me"] is None, ok)
+    url = new.ok("POST", "/api/auth/tg/start")["url"]
+    check("ссылка на бота с токеном", url.startswith("https://t.me/e2e_bot?start=reg_"), url)
+    token = url.split("start=reg_")[1]
+    bot(7001, text="/start reg_" + token)
+    bot(7001, contact={"phone_number": "79005554433", "user_id": 9999})
+    row = c.execute("SELECT chat_id, code FROM tg_regs WHERE token = ?", (reg_hash(token),)).fetchone()
+    check("чужой контакт не принят", row == (7001, None), row)
+    bot(7001, contact={"phone_number": "79005554433", "user_id": 7001})
+    row = c.execute("SELECT phone, code FROM tg_regs WHERE token = ?", (reg_hash(token),)).fetchone()
+    check("свой контакт: телефон сохранён, код выдан", row[0] == "+79005554433" and row[1], row)
+    c.execute("UPDATE tg_regs SET code = ? WHERE token = ?", (reg_hash("111111"), reg_hash(token)))
+    c.commit()
+    body = {"name": "ТГшник", "code": "111111", "password": pw, "password2": pw, "terms": True}
+    code, _ = Client(base, "10.0.1.2").call("POST", "/api/auth/register", body)
+    check("код из чужого браузера не подходит", code == 400, code)
+    code, err = new.call("POST", "/api/auth/register", {**body, "code": "222222"})
+    check("неверный код отклонён", code == 400 and "Неверный код" in str(err), err)
+    new.ok("POST", "/api/auth/register", body)
+    me_n = new.ok("GET", "/api/state")["me"]
+    check("аккаунт создан: телефон, Telegram, без email", me_n["phone"] == "+79005554433" and me_n["tg"] and me_n["email"] == "", me_n)
+    ph = Client(base, "10.0.1.3")
+    r = code_login(ph, "8 (900) 555-44-33", pw, me_n["id"])
+    check("вход по телефону в любом формате → код в Telegram", r.get("need_code") is True, r)
+    ph.ok("POST", "/api/auth/login/code", {"ticket": r["ticket"], "code": "777777"})
+    check("вход по коду выполнен", ph.ok("GET", "/api/state")["me"]["id"] == me_n["id"])
+    again = Client(base, "10.0.1.4")
+    t2 = again.ok("POST", "/api/auth/tg/start")["url"].split("start=reg_")[1]
+    bot(7001, text="/start reg_" + t2)
+    row = c.execute("SELECT chat_id FROM tg_regs WHERE token = ?", (reg_hash(t2),)).fetchone()
+    check("второй аккаунт на тот же Telegram не завести", row == (None,), row)
+    bot(7002, text="/start reg_" + t2)
+    bot(7002, contact={"phone_number": "+7 900 555-44-33", "user_id": 7002})
+    row = c.execute("SELECT code FROM tg_regs WHERE token = ?", (reg_hash(t2),)).fetchone()
+    check("второй аккаунт на тот же номер не завести", row == (None,), row)
+    code, _ = new.call("POST", "/api/auth/reset", {"email": "+79005554433", "password": "NewPassw0rd1",
+                                                   "password2": "NewPassw0rd1", "contact": "@tg_user"})
+    check("сброс пароля по телефону принят", code == 200, code)
+
+    step("21. Удаление аккаунта с кодом из Telegram")
+    check("для удаления нужен код из Telegram", new.ok("GET", "/api/me/delete")["tg"] is True)
+    code, err = new.call("POST", "/api/me/delete", {"password": pw})
+    check("без кода не удалить", code == 400 and "код" in str(err).lower(), err)
+    new.ok("POST", "/api/me/delete/code")
+    c.execute("UPDATE users SET del_code = ? WHERE phone = '+79005554433'",
+              (hashlib.sha256(b"ruwork-del:654321").hexdigest(),))
+    c.commit()
+    code, err = new.call("POST", "/api/me/delete", {"password": pw, "code": "000000"})
+    check("неверный код отклонён", code == 400 and "Неверный код" in str(err), err)
+    new.ok("POST", "/api/me/delete", {"password": pw, "code": "654321"})
+    row = c.execute("SELECT phone, tg_chat, deleted_at FROM users WHERE id = ?", (me_n["id"],)).fetchone()
+    check("телефон и Telegram освобождены", row[0] is None and row[1] is None and row[2], row)
+    t3 = Client(base, "10.0.1.5").ok("POST", "/api/auth/tg/start")["url"].split("start=reg_")[1]
+    bot(7001, text="/start reg_" + t3)
+    bot(7001, contact={"phone_number": "79005554433", "user_id": 7001})
+    row = c.execute("SELECT code FROM tg_regs WHERE token = ?", (reg_hash(t3),)).fetchone()
+    check("с тем же номером и Telegram можно зарегистрироваться заново", row and row[0], row)
     c.close()
 
 

@@ -20,6 +20,8 @@ from .orders import remove_cover
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(auth.require_staff)])
 admin_only = [Depends(auth.require_admin)]
+# Контакт пользователя для списков: email, а у зарегистрированных через Telegram — телефон.
+CONTACT_SQL = f"CASE WHEN u.email LIKE '%{auth.TG_EMAIL_DOMAIN}' THEN coalesce(u.phone, '') ELSE u.email END"
 
 BLOCK_DAYS = (0, 1, 7, 30)  # 0 — бессрочно
 SHARED_IP_MAX = 10  # адрес, с которого заходят больше пользователей, — скорее всего общий (оператор, офис), не улика
@@ -37,7 +39,7 @@ class HideIn(BaseModel):
 # ---------- Заявки: пополнения, возвраты, выводы ----------
 
 OPS_SQL = (
-    "SELECT o.id, o.user_id, o.t, o.coins, o.fee, o.status, o.dest, o.phone, o.ts, u.name, u.email"
+    "SELECT o.id, o.user_id, o.t, o.coins, o.fee, o.status, o.dest, o.phone, o.ts, u.name, " + CONTACT_SQL + " AS email"
     " FROM wallet_ops o JOIN users u ON u.id = o.user_id WHERE o.t IN ('dep', 'wd', 'rf')"
 )
 
@@ -122,7 +124,7 @@ def platform(conn: sqlite3.Connection = Depends(get_db)):
 # ---------- Сброс пароля ----------
 
 RESETS_SQL = (
-    "SELECT r.id, r.contact, r.status, r.ts, u.name, u.email, r.user_id"
+    "SELECT r.id, r.contact, r.status, r.ts, u.name, " + CONTACT_SQL + " AS email, r.user_id"
     " FROM password_resets r JOIN users u ON u.id = r.user_id"
 )
 
@@ -158,7 +160,7 @@ def reset_decide(reset_id: str, act: str, staff=Depends(auth.require_admin), con
 def users(conn: sqlite3.Connection = Depends(get_db)):
     rows = conn.execute(
         "SELECT u.id, u.name, u.email, u.created_at, u.last_seen, u.blocked_at, u.block_reason, u.blocked_until,"
-        " u.verified, u.role, u.tg_chat IS NOT NULL AS tg,"
+        " u.verified, u.role, u.tg_chat IS NOT NULL AS tg, u.phone,"
         " COALESCE((SELECT coins FROM wallets w WHERE w.user_id = u.id), 0) AS coins,"
         " (SELECT count(*) FROM orders o WHERE o.user_id = u.id) AS orders,"
         " (SELECT count(*) FROM gigs g WHERE g.owner_id = u.id) AS gigs"
@@ -166,7 +168,8 @@ def users(conn: sqlite3.Connection = Depends(get_db)):
     ).fetchall()
     since = now_ms() - auth.ONLINE_MS
     return [
-        {**dict(r), "tg": bool(r["tg"]), "online": r["blocked_at"] is None and (r["last_seen"] or 0) >= since,
+        {**dict(r), "email": auth.shown_email(r["email"]) or r["phone"] or "",
+         "tg": bool(r["tg"]), "online": r["blocked_at"] is None and (r["last_seen"] or 0) >= since,
          "admin": r["email"] == auth.ADMIN_EMAIL}
         for r in rows
     ]
@@ -200,9 +203,9 @@ def linked(conn: sqlite3.Connection, user_id: str) -> list[dict]:
         why.setdefault(r[0], []).append(f"телефон вывода {r[1]}")
     out = []
     for uid, reasons in why.items():
-        u = conn.execute("SELECT id, name, email, blocked_at FROM users WHERE id = ?", (uid,)).fetchone()
+        u = conn.execute("SELECT id, name, email, phone, blocked_at FROM users WHERE id = ?", (uid,)).fetchone()
         if u:
-            out.append({**dict(u), "why": sorted(set(reasons))})
+            out.append({**dict(u), "email": auth.shown_email(u["email"]) or u["phone"] or "", "why": sorted(set(reasons))})
     return out
 
 
@@ -257,7 +260,8 @@ def block_user(user_id: str, body: BlockIn, staff=Depends(auth.require_staff), c
 
 @router.post("/users/{user_id}/unblock")
 def unblock_user(user_id: str, staff=Depends(auth.require_staff), conn: sqlite3.Connection = Depends(get_db)):
-    target_user(conn, user_id, staff)
+    if target_user(conn, user_id, staff)["deleted_at"]:
+        raise HTTPException(400, "Аккаунт удалён владельцем — восстановить его нельзя")
     conn.execute("UPDATE users SET blocked_at = NULL, block_reason = '', blocked_until = NULL WHERE id = ?", (user_id,))
     audit(conn, staff, "unblock", "Разблокировка", user_id)
     return users(conn)
@@ -280,7 +284,7 @@ def verify_user(user_id: str, on: int, staff=Depends(auth.require_staff), conn: 
 @router.get("/gigs")
 def gigs(conn: sqlite3.Connection = Depends(get_db)):
     rows = conn.execute(
-        f"SELECT g.*, {SOLD_SQL}, u.email AS owner_email, u.blocked_at IS NOT NULL AS owner_blocked"
+        f"SELECT g.*, {SOLD_SQL}, {CONTACT_SQL} AS owner_email, u.blocked_at IS NOT NULL AS owner_blocked"
         " FROM gigs g LEFT JOIN users u ON u.id = g.owner_id"
         " ORDER BY g.mod = 'pending' DESC, g.owner_id IS NULL, g.created_at DESC, g.id"
     ).fetchall()

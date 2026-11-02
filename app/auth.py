@@ -52,6 +52,38 @@ def password_error(password: str) -> str | None:
     return None
 
 
+# Аккаунт, зарегистрированный через Telegram, не имеет почты: в users.email (NOT NULL UNIQUE) хранится
+# служебный адрес в зарезервированной зоне .invalid, наружу он не отдаётся.
+TG_EMAIL_DOMAIN = "@tg.invalid"
+
+
+def norm_phone(text: str) -> str | None:
+    """+7XXXXXXXXXX из «8 900 123-45-67», «79001234567» и т. п.; None, если это не телефон."""
+    if "@" in text:
+        return None
+    digits = "".join(c for c in text if c.isdigit())
+    if len(digits) == 11 and digits[0] == "8":
+        digits = "7" + digits[1:]
+    elif len(digits) == 10 and digits[0] == "9":
+        digits = "7" + digits
+    return "+" + digits if 11 <= len(digits) <= 15 else None
+
+
+def login_key(login: str) -> str:
+    """Нормализованный логин — телефон или email: по нему ищется аккаунт и считаются попытки входа."""
+    return norm_phone(login) or norm_email(login)
+
+
+def find_user(conn: sqlite3.Connection, login: str) -> sqlite3.Row | None:
+    key = login_key(login)
+    col = "phone" if key.startswith("+") else "email"
+    return conn.execute(f"SELECT * FROM users WHERE {col} = ?", (key,)).fetchone() if key else None
+
+
+def shown_email(email: str) -> str:
+    return "" if email.endswith(TG_EMAIL_DOMAIN) else email
+
+
 def norm_email(email: str) -> str:
     """Gmail игнорирует точки и +метки, поэтому приводим адрес к одному виду: так нельзя завести дубль."""
     email = email.strip().lower()
@@ -64,7 +96,7 @@ def norm_email(email: str) -> str:
     return email
 
 
-def start_session(conn: sqlite3.Connection, response: Response, user_id: str) -> None:
+def start_session(conn: sqlite3.Connection, response: Response, user_id: str) -> str:
     token = secrets.token_urlsafe(32)
     conn.execute(
         "INSERT INTO sessions(token, user_id, created_at) VALUES (?, ?, ?)", (token, user_id, now_ms())
@@ -72,6 +104,7 @@ def start_session(conn: sqlite3.Connection, response: Response, user_id: str) ->
     response.set_cookie(
         SESSION_COOKIE, token, max_age=SESSION_TTL_MS // 1000, httponly=True, samesite="lax", path="/"
     )
+    return token
 
 
 def end_session(conn: sqlite3.Connection, request: Request, response: Response) -> None:
@@ -172,7 +205,8 @@ def require_admin(user: sqlite3.Row = Depends(require_staff)) -> sqlite3.Row:
 def public_user(user: sqlite3.Row | None) -> dict | None:
     if user is None:
         return None
-    out = {"id": user["id"], "name": user["name"], "email": user["email"],
+    out = {"id": user["id"], "name": user["name"], "email": shown_email(user["email"]),
+           "phone": user["phone"] if "phone" in user.keys() else None,
            "about": user["about"] if "about" in user.keys() else "",
            "avatar": user["avatar"] if "avatar" in user.keys() else None,
            "tg": bool(user["tg_chat"]) if "tg_chat" in user.keys() else False,

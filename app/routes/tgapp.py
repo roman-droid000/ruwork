@@ -176,17 +176,16 @@ def state(chat_id: int = Depends(tg_id), conn: sqlite3.Connection = Depends(get_
 
 @router.post("/api/tgapp/login")
 def login(body: LoginIn, chat_id: int = Depends(tg_id), conn: sqlite3.Connection = Depends(get_db)):
-    email = auth.norm_email(body.email)
-    keys = (f"login-tg:{chat_id}", f"login-email:{email}")
+    keys = (f"login-tg:{chat_id}", f"login-email:{auth.login_key(body.email)}")
     if limited(keys[0], LOGIN_PER_TG) or limited(keys[1], LOGIN_PER_EMAIL):
         raise HTTPException(429, "Слишком много попыток — попробуйте через 15 минут")
-    user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    user = auth.find_user(conn, body.email)
     if user is None:
         auth.hash_pw(body.password, DUMMY_SALT)  # столько же времени, сколько проверка настоящего пароля
     if user is None or not body.password or not auth.check_pw(user, body.password):
         hit(keys[0])
         hit(keys[1])
-        raise HTTPException(400, "Неверный email или пароль")
+        raise HTTPException(400, "Неверный логин или пароль")
     if user["blocked_at"] is not None:
         raise HTTPException(403, auth.blocked_message(user))
     if auth.staff_role(user) and user["tg_chat"] and user["tg_chat"] != chat_id:

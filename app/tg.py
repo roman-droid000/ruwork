@@ -24,7 +24,17 @@ WEBHOOK = os.environ.get("RUWORK_TG_WEBHOOK", "1") != "0"
 PUBLIC_URL = os.environ.get("RUWORK_PUBLIC_URL", "https://ruwork.shop").rstrip("/")
 # Секрет в адресе webhook и в заголовке: чужие запросы на /api/tg/... отклоняются.
 SECRET = hashlib.sha256(("ruwork-tg:" + TOKEN).encode()).hexdigest()[:40] if TOKEN else ""
-username = ""
+username = os.environ.get("RUWORK_TG_BOT", "")  # уточняется через getMe при старте
+
+# Регистрация через бота: сайт выдаёт ссылку t.me/<бот>?start=reg_<токен> (токен — и в cookie браузера),
+# бот просит поделиться контактом и присылает код, код вводится на сайте. В tg_regs хранятся sha256 токена и кода.
+REG_TTL_MS = 30 * 60 * 1000  # сколько живёт начатая регистрация
+REG_CODE_TTL_MS = 10 * 60 * 1000
+REG_CODE_TRIES = 5
+
+
+def reg_hash(text: str) -> str:
+    return hashlib.sha256(("ruwork-reg:" + text).encode()).hexdigest()
 
 log = logging.getLogger("ruwork.tg")
 

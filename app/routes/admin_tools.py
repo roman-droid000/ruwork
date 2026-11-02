@@ -56,7 +56,7 @@ def reconcile_rows(conn: sqlite3.Connection) -> list[dict]:
         e, h = exp.get(uid, 0), have.get(uid, 0)
         if e != h:
             u = conn.execute("SELECT name, email FROM users WHERE id = ?", (uid,)).fetchone()
-            out.append({"user_id": uid, "name": u["name"] if u else "удалён", "email": u["email"] if u else "",
+            out.append({"user_id": uid, "name": u["name"] if u else "удалён", "email": auth.shown_email(u["email"]) if u else "",
                         "coins": h, "expected": e, "diff": h - e})
     return sorted(out, key=lambda r: -abs(r["diff"]))
 
@@ -221,9 +221,10 @@ def search(q: str, conn: sqlite3.Connection = Depends(get_db)):
     phone_users = ([r[0] for r in conn.execute("SELECT DISTINCT user_id FROM wallet_ops WHERE phone LIKE ?", (f"%{digits[-10:]}%",))]
                    if len(digits) >= 4 else [])
     users = conn.execute(
-        "SELECT id, name, email, blocked_at, created_at FROM users WHERE lower(name) LIKE ? OR lower(email) LIKE ? OR id = ?"
-        f" OR id IN ({','.join('?' * len(phone_users)) or 'NULL'}) LIMIT 20",
-        (like, like, q, *phone_users)).fetchall()
+        "SELECT id, name, CASE WHEN email LIKE ? THEN coalesce(phone, '') ELSE email END AS email, blocked_at, created_at"
+        " FROM users WHERE lower(name) LIKE ? OR lower(email) LIKE ? OR id = ?"
+        f" OR (? != '' AND phone LIKE ?) OR id IN ({','.join('?' * len(phone_users)) or 'NULL'}) LIMIT 20",
+        ("%" + auth.TG_EMAIL_DOMAIN, like, like, q, digits, f"%{digits[-10:]}%", *phone_users)).fetchall()
     num = q.upper().lstrip("#")
     orders = conn.execute(
         "SELECT o.id, o.num, o.title, o.status, o.amount, b.name AS buyer FROM orders o JOIN users b ON b.id = o.user_id"

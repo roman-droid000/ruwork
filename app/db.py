@@ -243,6 +243,22 @@ CREATE TABLE IF NOT EXISTS errors (
     path TEXT NOT NULL,
     msg  TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tg_regs (
+    token     TEXT PRIMARY KEY,
+    ts        INTEGER NOT NULL,
+    chat_id   INTEGER,
+    phone     TEXT,
+    code      TEXT,
+    code_ts   INTEGER,
+    tries     INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS login_codes (
+    ticket  TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code    TEXT NOT NULL,
+    ts      INTEGER NOT NULL,
+    tries   INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS tg_support (
     admin_msg   INTEGER PRIMARY KEY,
     client_chat INTEGER NOT NULL,
@@ -441,6 +457,16 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sessions ADD COLUMN mfa_code TEXT")
             conn.execute("ALTER TABLE sessions ADD COLUMN mfa_sent INTEGER")
             conn.execute("ALTER TABLE sessions ADD COLUMN mfa_tries INTEGER NOT NULL DEFAULT 0")
+        # Миграция: телефон из Telegram — регистрация через бота вместо email, вход по телефону.
+        if "phone" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN phone TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_phone ON users(phone) WHERE phone IS NOT NULL")
+        # Миграция: удаление аккаунта владельцем (обезличивание) и одноразовый код подтверждения из Telegram.
+        if "deleted_at" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN deleted_at INTEGER")
+            conn.execute("ALTER TABLE users ADD COLUMN del_code TEXT")
+            conn.execute("ALTER TABLE users ADD COLUMN del_code_ts INTEGER")
+            conn.execute("ALTER TABLE users ADD COLUMN del_tries INTEGER NOT NULL DEFAULT 0")
         for sub in ("covers", "results", "avatars", "reviews", "portfolio"):
             (UPLOAD_DIR / sub).mkdir(parents=True, exist_ok=True)
         with tx(conn):

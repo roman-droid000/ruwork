@@ -25,9 +25,15 @@ RESET_TG_TTL_MS = 30 * 60 * 1000  # ссылка подтверждения сб
 DUMMY_SALT = b"\0" * 16  # хэш для несуществующего email: время ответа не выдаёт, есть ли аккаунт
 
 
+REG_COOKIE = "ruwork_reg"
+TG_START_PER_IP = (10, 3600)
+
+
 class RegisterIn(BaseModel):
     name: str
-    email: str
+    email: str = ""  # только если бот не настроен — иначе регистрация по коду из Telegram
+    code: str = ""
+    check_only: bool = False  # проверить имя и пароль до кода: окно с кодом открывается только после этого
     password: str
     password2: str
     terms: bool
@@ -36,6 +42,16 @@ class RegisterIn(BaseModel):
 class LoginIn(BaseModel):
     email: str
     password: str
+
+
+class LoginCodeIn(BaseModel):
+    ticket: str
+    code: str = ""
+
+
+LOGIN_CODE_TTL_MS = 10 * 60 * 1000
+LOGIN_CODE_TRIES = 5
+LOGIN_RESEND = (3, 600)
 
 
 class ResetIn(BaseModel):
@@ -63,17 +79,53 @@ def name_taken(conn: sqlite3.Connection, name: str, except_id: str = "", admin: 
     return bool(conn.execute("SELECT 1 FROM users WHERE name = ? AND id != ?", (name, except_id)).fetchone())
 
 
+def tg_reg_on() -> bool:
+    """Регистрация только через Telegram, когда настроен бот; без бота (локально) — по email."""
+    return bool(tg.TOKEN)
+
+
+@router.post("/auth/tg/start")
+def tg_reg_start(request: Request, response: Response, conn: sqlite3.Connection = Depends(get_db)):
+    """Начать регистрацию: ссылка на бота с одноразовым токеном; тот же токен — в cookie этого браузера,
+    чтобы код из Telegram подошёл только к начатой здесь регистрации."""
+    if not (tg_reg_on() and tg.username):
+        raise HTTPException(400, "Регистрация через Telegram пока недоступна")
+    guard.throttle("tgreg-ip:" + guard.client_ip(request), TG_START_PER_IP, "Слишком много попыток — попробуйте позже")
+    token = secrets.token_urlsafe(18)
+    conn.execute("DELETE FROM tg_regs WHERE ts < ?", (now_ms() - tg.REG_TTL_MS,))
+    conn.execute("INSERT INTO tg_regs(token, ts) VALUES (?, ?)", (tg.reg_hash(token), now_ms()))
+    response.set_cookie(REG_COOKIE, token, max_age=tg.REG_TTL_MS // 1000, httponly=True, samesite="lax", path="/")
+    return {"url": f"https://t.me/{tg.username}?start=reg_{token}"}
+
+
+def check_reg_code(conn: sqlite3.Connection, request: Request, code: str) -> sqlite3.Row:
+    """Заявка на регистрацию этого браузера с подтверждённым в боте телефоном и верным кодом."""
+    token = request.cookies.get(REG_COOKIE, "")
+    r = conn.execute("SELECT * FROM tg_regs WHERE token = ?", (tg.reg_hash(token),)).fetchone() if token else None
+    if r is None or r["ts"] < now_ms() - tg.REG_TTL_MS:
+        raise HTTPException(400, "Нажмите «Получить код в Telegram» и поделитесь контактом в боте")
+    if not r["code"]:
+        raise HTTPException(400, "Сначала поделитесь контактом в боте — он пришлёт код")
+    if r["code_ts"] < now_ms() - tg.REG_CODE_TTL_MS or r["tries"] >= tg.REG_CODE_TRIES:
+        raise HTTPException(400, "Код устарел — нажмите «Получить код в Telegram» ещё раз")
+    if not secrets.compare_digest(tg.reg_hash(code.strip()), r["code"]):
+        conn.execute("UPDATE tg_regs SET tries = tries + 1 WHERE token = ?", (r["token"],))
+        raise HTTPException(400, f"Неверный код. Осталось попыток: {tg.REG_CODE_TRIES - r['tries'] - 1}")
+    return r
+
+
 @router.post("/auth/register")
 def register(body: RegisterIn, request: Request, response: Response, conn: sqlite3.Connection = Depends(get_db)):
     if guard.limited("reg-ip:" + guard.client_ip(request), REGISTER_PER_IP):
         raise HTTPException(429, "Слишком много регистраций с этого адреса — попробуйте через час")
     name, email = esc(body.name.strip()), auth.norm_email(body.email)
+    via_tg = tg_reg_on()
     err = None
     if len(name) < 2 or len(name) > 40:
         err = "Введите имя (минимум 2 символа)"
     elif name_taken(conn, name):
         err = "Это имя занято, выберите другое"
-    elif not auth.EMAIL_RE.match(body.email.strip()) or len(body.email) > 120:
+    elif not via_tg and (not auth.EMAIL_RE.match(body.email.strip()) or len(body.email) > 120):
         err = "Введите корректный email"
     elif auth.password_error(body.password) or len(body.password) > 100:
         err = "Пароль: минимум 8 символов, буквы и цифры"
@@ -81,45 +133,112 @@ def register(body: RegisterIn, request: Request, response: Response, conn: sqlit
         err = "Пароли не совпадают"
     elif not body.terms:
         err = "Подтвердите согласие с условиями"
-    elif email == auth.ADMIN_EMAIL:
+    elif not via_tg and email == auth.ADMIN_EMAIL:
         err = "Этот email недоступен"
-    elif conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
+    elif not via_tg and conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
         err = "Аккаунт с таким email уже существует. Войдите."
     if err:
         raise HTTPException(400, err)
+    if body.check_only:
+        return {"ok": True}
+    if via_tg and not body.code.strip():
+        raise HTTPException(400, "Введите код из Telegram")
+    phone = chat = None
+    if via_tg:
+        r = check_reg_code(conn, request, body.code)
+        phone, chat = r["phone"], r["chat_id"]
+        if conn.execute("SELECT 1 FROM users WHERE phone = ? OR tg_chat = ?", (phone, chat)).fetchone():
+            raise HTTPException(400, "Этот номер или Telegram уже зарегистрирован. Войдите по номеру телефона и паролю.")
+        email = f"tg{secrets.token_hex(8)}{auth.TG_EMAIL_DOMAIN}"
     guard.hit("reg-ip:" + guard.client_ip(request))
     salt, pw_hash = auth.new_password(body.password)
     user_id = new_id("u")
     with tx(conn):
         conn.execute(
-            "INSERT INTO users(id, name, email, salt, hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, name, email, salt, pw_hash, now_ms()),
+            "INSERT INTO users(id, name, email, salt, hash, created_at, phone, tg_chat) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, name, email, salt, pw_hash, now_ms(), phone, chat),
         )
+        if via_tg:
+            conn.execute("DELETE FROM tg_regs WHERE chat_id = ?", (chat,))
         auth.start_session(conn, response, user_id)
         auth.remember_ip(conn, user_id, guard.client_ip(request))
-    return {"me": {"id": user_id, "name": name, "email": email}}
+    if via_tg:
+        response.delete_cookie(REG_COOKIE, path="/")
+        tg.send(chat, f"Аккаунт RUWORK «{name}» создан. Входите на сайте по номеру {phone} и паролю. Сюда будут "
+                      "приходить уведомления о заказах и сообщениях. Отключить: /stop")
+    return {"me": {"id": user_id, "name": name, "email": auth.shown_email(email), "phone": phone}}
 
 
 @router.post("/auth/login")
 def login(body: LoginIn, request: Request, response: Response, conn: sqlite3.Connection = Depends(get_db)):
-    email = auth.norm_email(body.email)
-    if not email or not body.password:
-        raise HTTPException(400, "Введите email и пароль")
-    keys = ("login-ip:" + guard.client_ip(request), "login-email:" + email)
+    key = auth.login_key(body.email)
+    if not key or not body.password:
+        raise HTTPException(400, "Введите телефон или email и пароль")
+    keys = ("login-ip:" + guard.client_ip(request), "login-email:" + key)
     if guard.limited(keys[0], LOGIN_PER_IP) or guard.limited(keys[1], LOGIN_PER_EMAIL):
         raise HTTPException(429, "Слишком много попыток входа — попробуйте через 15 минут или восстановите пароль")
-    user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    user = auth.find_user(conn, body.email)
     if user is None:
         auth.hash_pw(body.password, DUMMY_SALT)  # столько же времени, сколько проверка настоящего пароля
     if not user or not auth.check_pw(user, body.password):
         guard.hit(keys[0])
         guard.hit(keys[1])
-        raise HTTPException(400, "Неверный email или пароль")
+        raise HTTPException(400, "Неверный логин или пароль")
     if user["blocked_at"] is not None:
         raise HTTPException(403, auth.blocked_message(user))
+    if user["tg_chat"] and tg.TOKEN:
+        # Второй шаг: код в Telegram. Сессия появится после ввода кода (POST /auth/login/code).
+        ticket = secrets.token_urlsafe(24)
+        conn.execute("DELETE FROM login_codes WHERE ts < ? OR user_id = ?", (now_ms() - LOGIN_CODE_TTL_MS, user["id"]))
+        conn.execute("INSERT INTO login_codes(ticket, user_id, code, ts) VALUES (?, ?, '', ?)",
+                     (token_hash(ticket), user["id"], now_ms()))
+        send_login_code(conn, user, ticket)
+        return {"need_code": True, "ticket": ticket}
     auth.start_session(conn, response, user["id"])
     auth.remember_ip(conn, user["id"], guard.client_ip(request))
     return {"me": auth.public_user(user)}
+
+
+def send_login_code(conn: sqlite3.Connection, user, ticket: str) -> None:
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    conn.execute("UPDATE login_codes SET code = ?, ts = ?, tries = 0 WHERE ticket = ?",
+                 (token_hash("login:" + code), now_ms(), token_hash(ticket)))
+    tg.send(user["tg_chat"], f"Код для входа на RUWORK: {code}\nДействует 10 минут. Если вы не входите на сайт — "
+                             "никому не сообщайте код и смените пароль.")
+
+
+def login_ticket(conn: sqlite3.Connection, ticket: str) -> sqlite3.Row:
+    r = conn.execute("SELECT c.*, u.tg_chat, u.blocked_at FROM login_codes c JOIN users u ON u.id = c.user_id"
+                     " WHERE c.ticket = ?", (token_hash(ticket),)).fetchone() if ticket else None
+    if r is None or r["ts"] < now_ms() - LOGIN_CODE_TTL_MS or r["blocked_at"] is not None:
+        raise HTTPException(400, "Код устарел — войдите ещё раз")
+    return r
+
+
+@router.post("/auth/login/code")
+def login_code(body: LoginCodeIn, request: Request, response: Response, conn: sqlite3.Connection = Depends(get_db)):
+    """Второй шаг входа: код из Telegram. Сотруднику он же подтверждает вход в админ-панель."""
+    r = login_ticket(conn, body.ticket)
+    if r["tries"] >= LOGIN_CODE_TRIES:
+        raise HTTPException(400, "Слишком много неверных кодов — нажмите «Отправить ещё раз»")
+    if not secrets.compare_digest(token_hash("login:" + body.code.strip()), r["code"]):
+        conn.execute("UPDATE login_codes SET tries = tries + 1 WHERE ticket = ?", (r["ticket"],))
+        raise HTTPException(400, f"Неверный код. Осталось попыток: {LOGIN_CODE_TRIES - r['tries'] - 1}")
+    conn.execute("DELETE FROM login_codes WHERE ticket = ?", (r["ticket"],))
+    user = conn.execute("SELECT * FROM users WHERE id = ?", (r["user_id"],)).fetchone()
+    token = auth.start_session(conn, response, user["id"])
+    if auth.staff_role(user):  # тот же второй фактор, что и для админ-панели — второй раз код не нужен
+        conn.execute("UPDATE sessions SET mfa_at = ? WHERE token = ?", (now_ms(), token))
+    auth.remember_ip(conn, user["id"], guard.client_ip(request))
+    return {"me": auth.public_user(user)}
+
+
+@router.post("/auth/login/resend")
+def login_resend(body: LoginCodeIn, conn: sqlite3.Connection = Depends(get_db)):
+    r = login_ticket(conn, body.ticket)
+    guard.throttle("loginsend:" + r["user_id"], LOGIN_RESEND, "Код уже отправлен — подождите несколько минут")
+    send_login_code(conn, r, body.ticket)
+    return {"ok": True}
 
 
 @router.post("/auth/reset")
@@ -127,22 +246,22 @@ def request_reset(body: ResetIn, request: Request, conn: sqlite3.Connection = De
     """Заявка на сброс пароля. Если к аккаунту привязан Telegram, бот присылает кнопку подтверждения
     и пароль меняется сразу по ней. Иначе (или если кнопку не нажали) решает администратор."""
     contact = esc(body.contact.strip())[:100]
-    if not auth.EMAIL_RE.match(body.email.strip()) or len(body.email) > 120:
-        raise HTTPException(400, "Введите корректный email")
+    if not (auth.norm_phone(body.email) or auth.EMAIL_RE.match(body.email.strip())) or len(body.email) > 120:
+        raise HTTPException(400, "Введите телефон или email аккаунта")
     if auth.password_error(body.password) or len(body.password) > 100:
         raise HTTPException(400, "Новый пароль: минимум 8 символов, буквы и цифры")
     if body.password != body.password2:
         raise HTTPException(400, "Пароли не совпадают")
     if len(contact) < 3:
         raise HTTPException(400, "Укажите контакт для связи: Telegram или телефон")
-    email = auth.norm_email(body.email)
+    email = auth.login_key(body.email)
     keys = ("reset-ip:" + guard.client_ip(request), "reset-email:" + email)
     if guard.limited(keys[0], RESET_PER_IP) or guard.limited(keys[1], RESET_PER_EMAIL):
         raise HTTPException(429, "Слишком много заявок — попробуйте через час")
     guard.hit(keys[0])
     guard.hit(keys[1])
     salt, pw_hash = auth.new_password(body.password)  # считаем всегда, чтобы время ответа не выдавало наличие аккаунта
-    user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    user = auth.find_user(conn, body.email)
     # Ответ одинаковый, есть аккаунт или нет, чтобы по форме нельзя было проверить, зарегистрирован ли email.
     # Пароль администратора через заявку не сбрасывается: он меняется только в профиле.
     if user is not None and not auth.is_admin(user) and user["blocked_at"] is None:
@@ -161,7 +280,7 @@ def request_reset(body: ResetIn, request: Request, conn: sqlite3.Connection = De
                            "и не пересылайте это сообщение.",
                            "Да, сменить пароль", f"{tg.PUBLIC_URL}/api/auth/reset/tg/{token}")
         else:
-            guard.alert(f"Заявка на сброс пароля: {user['name']} ({user['email']}), контакт: {contact}",
+            guard.alert(f"Заявка на сброс пароля: {user['name']} ({auth.shown_email(user['email']) or user['phone']}), контакт: {contact}",
                         "#/admin/resets")
     return {"ok": True}
 

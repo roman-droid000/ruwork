@@ -9,10 +9,12 @@ chat_id для RUWORK_TG_SUPPORT_CHAT бот подскажет по коман�
 
 import logging
 import os
+import secrets
 import sqlite3
 import time
 
 from . import tg
+from . import auth
 from .db import now_ms
 
 SUPPORT_CHAT = int(os.environ.get("RUWORK_TG_SUPPORT_CHAT", "0") or 0)
@@ -164,8 +166,52 @@ def on_button(cb: dict) -> None:
         say(chat, "Выберите вопрос:", menu_kb())
 
 
+CONTACT_KB = {"keyboard": [[{"text": "📱 Поделиться контактом", "request_contact": True}]],
+              "resize_keyboard": True, "one_time_keyboard": True}
+NO_KB = {"remove_keyboard": True}
+
+
+def reg_start(conn: sqlite3.Connection, chat: int, token: str) -> None:
+    """/start reg_<токен> со страницы регистрации: запомнить чат и попросить контакт."""
+    r = conn.execute("SELECT * FROM tg_regs WHERE token = ?", (tg.reg_hash(token),)).fetchone()
+    if r is None or r["ts"] < now_ms() - tg.REG_TTL_MS:
+        return say(chat, "Ссылка регистрации устарела. Вернитесь на сайт и нажмите «Получить код в Telegram» ещё раз.")
+    acc = conn.execute("SELECT name FROM users WHERE tg_chat = ?", (chat,)).fetchone()
+    if acc:
+        return say(chat, f"Этот Telegram уже привязан к аккаунту RUWORK «{acc['name']}». Войдите в него на сайте "
+                         "по номеру телефона и паролю. Забыли пароль — нажмите «Забыл пароль» на странице входа.")
+    conn.execute("UPDATE tg_regs SET chat_id = ?, phone = NULL, code = NULL WHERE token = ?", (chat, r["token"]))
+    say(chat, "Регистрация на RUWORK. Нажмите кнопку «📱 Поделиться контактом» внизу — пришлём код для сайта. "
+              "Номер станет логином для входа.", CONTACT_KB)
+
+
+def reg_contact(conn: sqlite3.Connection, msg: dict) -> None:
+    """Контакт из кнопки: свой номер → код регистрации."""
+    chat, contact = msg["chat"]["id"], msg["contact"]
+    if contact.get("user_id") != (msg.get("from") or {}).get("id"):
+        return say(chat, "Нужен ваш собственный контакт — нажмите кнопку «📱 Поделиться контактом».", CONTACT_KB)
+    r = conn.execute("SELECT * FROM tg_regs WHERE chat_id = ? AND ts > ? ORDER BY ts DESC LIMIT 1",
+                     (chat, now_ms() - tg.REG_TTL_MS)).fetchone()
+    if r is None:
+        return say(chat, "Чтобы зарегистрироваться, откройте RUWORK и нажмите «Получить код в Telegram».", NO_KB)
+    phone = auth.norm_phone(contact.get("phone_number", ""))
+    if not phone:
+        return say(chat, "Не удалось распознать номер. Попробуйте ещё раз.", CONTACT_KB)
+    if conn.execute("SELECT 1 FROM users WHERE phone = ?", (phone,)).fetchone():
+        return say(chat, f"Номер {phone} уже зарегистрирован. Войдите на сайте по номеру и паролю.", NO_KB)
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    conn.execute("UPDATE tg_regs SET phone = ?, code = ?, code_ts = ?, tries = 0 WHERE token = ?",
+                 (phone, tg.reg_hash(code), now_ms(), r["token"]))
+    say(chat, f"Код для регистрации на RUWORK: {code}\n\nВведите его на сайте. Код действует 10 минут. "
+              "Никому его не сообщайте — сотрудники RUWORK его не спрашивают.", NO_KB)
+
+
 def on_client(conn: sqlite3.Connection, msg: dict, text: str) -> None:
     chat = msg["chat"]["id"]
+    if msg.get("contact"):
+        return reg_contact(conn, msg)
+    if text.startswith("/start reg_"):
+        return reg_start(conn, chat, text[len("/start reg_"):].strip())
     if text.startswith("/start"):
         code = text[6:].strip()
         u = conn.execute("SELECT id, name FROM users WHERE tg_code = ?", (code,)).fetchone() if code and tg.link_code_fresh(code) else None
@@ -194,9 +240,9 @@ def on_client(conn: sqlite3.Connection, msg: dict, text: str) -> None:
     who = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x) or "Без имени"
     if frm.get("username"):
         who += f" (@{frm['username']})"
-    acc = conn.execute("SELECT name, email FROM users WHERE tg_chat = ?", (chat,)).fetchone()
+    acc = conn.execute("SELECT name, email, phone FROM users WHERE tg_chat = ?", (chat,)).fetchone()
     head = f"📩 Обращение от {who}\nchat_id: {chat}\n"
-    head += f"Аккаунт RUWORK: {acc['name']}, {acc['email']}" if acc else "Аккаунт RUWORK не привязан"
+    head += f"Аккаунт RUWORK: {acc['name']}, {auth.shown_email(acc['email']) or acc['phone']}" if acc else "Аккаунт RUWORK не привязан"
     head += "\n\nОтветьте реплаем. Шаблоны: /t"
     h = say(SUPPORT_CHAT, head).get("result")
     c = _call("copyMessage", {"chat_id": SUPPORT_CHAT, "from_chat_id": chat, "message_id": msg["message_id"],

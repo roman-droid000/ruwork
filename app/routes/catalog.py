@@ -36,7 +36,8 @@ def meta(conn: sqlite3.Connection = Depends(get_db)):
     } if DEMO_CATALOG else {}
     return {"cats": SEED["cats"], "subs": SUBS, "minp": MINP, "syn": SEED["syn"], "sellers": sellers,
             "sbp_orders": SBP_ORDERS, "sale_fee_pct": SALE_FEE_PCT, "tg_on": bool(tg.TOKEN), "tg_bot": tg.username,
-            "promo_price": PROMO_PRICE, "bump_ms": BUMP_MS, "report_reasons": REASONS}
+            "promo_price": PROMO_PRICE, "bump_ms": BUMP_MS, "report_reasons": REASONS,
+            "reg_tg": bool(tg.TOKEN)}
 
 
 @router.get("/gigs")
