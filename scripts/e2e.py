@@ -247,6 +247,23 @@ def run(base: str, db: Path, tmp: Path) -> None:
     code, _ = seller.call("POST", "/api/reports", {"kind": "gig", "target": gig["id"], "reason": "Другое", "text": "на себя"})
     check("на своё объявление пожаловаться нельзя", code == 400)
 
+    step("10а. Идея по улучшению платформы")
+    code, _ = buyer.call("POST", "/api/ideas", {"text": "коротко"})
+    check("слишком короткая идея отклоняется", code == 400)
+    code, _ = Client(base, "10.0.0.9").call("POST", "/api/ideas", {"text": "Идея без входа в аккаунт"})
+    check("без входа идею не отправить", code == 401)
+    buyer.ok("POST", "/api/ideas", {"text": "Добавьте фильтр по сроку выполнения в каталоге"})
+    code, _ = buyer.call("GET", "/api/admin/ideas")
+    check("обычный пользователь не видит список идей", code in (401, 403))
+    ideas = admin.ok("GET", "/api/admin/ideas")
+    check("идея видна администратору", ideas and ideas[0]["status"] == "new" and "фильтр" in ideas[0]["text"], ideas)
+    ideas = admin.ok("POST", f"/api/admin/ideas/{ideas[0]['id']}/status", {"status": "planned"})
+    check("идея взята в планы", ideas[0]["status"] == "planned" and ideas[0]["status_at"])
+    check("автор идеи получил уведомление",
+          any("взяли её в работу" in n["text"] for n in buyer.ok("GET", "/api/notifications")["items"]))
+    code, _ = admin.call("POST", f"/api/admin/ideas/{ideas[0]['id']}/status", {"status": "bogus"})
+    check("неизвестный статус отклоняется", code == 400)
+
     step("11. Защита входа")
     attacker = Client(base, "10.0.0.99")
     codes = [attacker.call("POST", "/api/auth/login", {"email": me_s["email"], "password": f"wrong{i}x1"})[0]

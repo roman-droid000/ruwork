@@ -213,6 +213,15 @@ CREATE TABLE IF NOT EXISTS reports (
     UNIQUE (user_id, kind, target)
 );
 CREATE INDEX IF NOT EXISTS reports_status ON reports(status, ts);
+CREATE TABLE IF NOT EXISTS ideas (
+    id        TEXT PRIMARY KEY,
+    user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    text      TEXT NOT NULL,
+    status    TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    status_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS ideas_status ON ideas(status, ts);
 CREATE TABLE IF NOT EXISTS admin_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     ts         INTEGER NOT NULL,
