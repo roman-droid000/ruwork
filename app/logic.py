@@ -7,6 +7,7 @@ import re
 import secrets
 import sqlite3
 from collections import defaultdict
+from fractions import Fraction
 
 from . import tg
 from .db import SEED, now_ms
@@ -20,7 +21,7 @@ SBP_ORDERS = False  # оплата заказов через СБП времен
 DEMO_CATALOG = False
 PREMOD_FIRST = 3  # при включённой премодерации столько первых объявлений продавца проверяет администрация
 REFUND_WORK_PCT = 90  # возврат при отмене заказа «В работе»; до подтверждения возвращается 100 %
-SALE_FEE_PCT = 15  # комиссия платформы с каждой завершённой продажи
+SALE_FEE_PCT = 11.5  # комиссия с каждой завершённой продажи: 8,5 % платёжной системе, 3 % пригласившему или платформе
 PLATFORM_CANCEL_PCT = 5  # из удержанных 10 % платформе; остальное — продавцу за начатую работу
 AUTO_CONFIRM_MS = 7 * 86_400_000  # заказ «На проверке» подтверждается сам через 7 дней
 MIN_DEP, MAX_DEP = 100, 100_000
@@ -46,12 +47,12 @@ RESP_MIN_SAMPLES = 3  # меньше ответов — время ответа 
 DAY_MS = 86_400_000
 EXT_MAX_DAYS = 7  # на сколько дней продавец может попросить продлить срок за один запрос
 VACATION_MAX_MS = 90 * DAY_MS
-FEE_FREE_MS = 14 * DAY_MS  # первые 2 недели после регистрации продавец работает без комиссии
-FEE_LOW_MS = 28 * DAY_MS  # следующие 2 недели — сниженная комиссия FEE_LOW_PCT
-FEE_LOW_PCT = 10
+FEE_FREE_MS = 7 * DAY_MS  # первую неделю после регистрации продавец работает без комиссии
+FEE_LOW_MS = 21 * DAY_MS  # следующие 2 недели (2-я и 3-я) — сниженная комиссия FEE_LOW_PCT
+FEE_LOW_PCT = 9  # = платёжная система 8,5 % + доля пригласившего 0,5 %: платформе в этот период ничего
 REF_PCT = 3  # пригласивший получает столько % от суммы каждой продажи приглашённого (из комиссии, не больше неё)
-PAY_SYS_PCT = 8  # из комиссии с продажи столько % от суммы продажи уходит платёжной системе (учитывается отдельно)
-REF_LOW_PCT = 1  # ...а пока у приглашённого сниженная комиссия FEE_LOW_PCT (3-я и 4-я недели) — столько
+PAY_SYS_PCT = 8.5  # из комиссии с продажи столько % от суммы продажи уходит платёжной системе (учитывается отдельно)
+REF_LOW_PCT = 0.5  # ...а пока у приглашённого сниженная комиссия FEE_LOW_PCT (2-я и 3-я недели) — столько
 REF_MS = 180 * DAY_MS  # сколько после регистрации приглашённого действует эта доля
 WELCOME_BONUS = 150  # приветственный бонус на заказы новым пользователям
 SHARE_VISITS = 5  # столько разных посетителей по ссылке «Поделиться» — и объявление получает день продвижения
@@ -188,13 +189,24 @@ def platform_add(conn: sqlite3.Connection, kind: str, coins: int, user_id=None, 
         )
 
 
-def sale_fee(amount: int, pct: int = SALE_FEE_PCT) -> int:
+def pct_part(amount: int, pct: float, up: bool = False) -> int:
+    """pct % от суммы в целых монетах (проценты бывают дробными, например 11,5): точно, без погрешности float."""
+    v = Fraction(amount) * Fraction(str(pct)) / 100
+    return math.ceil(v) if up else math.floor(v)
+
+
+def pct_s(pct: float) -> str:
+    """Процент для текста: 11.5 → «11,5», 15 → «15»."""
+    return f"{pct:g}".replace(".", ",")
+
+
+def sale_fee(amount: int, pct: float = SALE_FEE_PCT) -> int:
     """Комиссия платформы с продажи, округление вверх до монеты."""
-    return -(-amount * pct // 100)
+    return pct_part(amount, pct, up=True)
 
 
 def fee_pct(conn: sqlite3.Connection, seller_id) -> int:
-    """Комиссия продавца в процентах по возрасту аккаунта: первые 2 недели 0, следующие 2 недели FEE_LOW_PCT,
+    """Комиссия продавца в процентах по возрасту аккаунта: первая неделя 0, следующие 2 недели FEE_LOW_PCT,
     потом SALE_FEE_PCT."""
     r = conn.execute("SELECT created_at FROM users WHERE id = ?", (seller_id,)).fetchone() if seller_id else None
     return fee_by_age(now_ms() - r["created_at"]) if r else SALE_FEE_PCT
@@ -209,16 +221,16 @@ def take_fee(conn: sqlite3.Connection, seller_id, fee: int, order_id, note: str,
     1. Платёжная система берёт PAY_SYS_PCT % с каждой продажи — всегда, даже когда у новичка комиссии нет:
        пишется в platform_ops с kind = "pay_sys" и в баланс платформы не входит.
     2. Пока с регистрации продавца не прошло REF_MS, пригласивший получает из комиссии REF_PCT % от суммы продажи,
-       а пока у продавца сниженная комиссия (3-я и 4-я недели) — REF_LOW_PCT % (не больше самой комиссии).
+       а пока у продавца сниженная комиссия (2-я и 3-я недели) — REF_LOW_PCT % (не больше самой комиссии).
        Доля пригласившему — заработок, его можно вывести.
-    3. Остаток — платформе (sale_fee). Если комиссии не хватает на платёжную систему (первые 2 недели без комиссии),
+    3. Остаток — платформе (sale_fee). Если комиссии не хватает на платёжную систему (первая неделя без комиссии),
        разницу платформа доплачивает из своих: запись kind = "pay_cover" с минусом."""
-    pay = amount * PAY_SYS_PCT // 100
+    pay = pct_part(amount, PAY_SYS_PCT)
     ref = 0
     r = conn.execute("SELECT ref_by, created_at FROM users WHERE id = ?", (seller_id,)).fetchone() if seller_id and fee > 0 else None
     if r and r["ref_by"] and now_ms() - r["created_at"] < REF_MS:
         pct = REF_LOW_PCT if now_ms() - r["created_at"] < FEE_LOW_MS else REF_PCT
-        ref = min(fee, amount * pct // 100)
+        ref = min(max(0, fee - pay), pct_part(amount, pct))  # доля — только из остатка после платёжной системы
         if ref:
             add_coins(conn, r["ref_by"], ref, ref)
             add_op(conn, r["ref_by"], "refb", "bal", ref, "done", note)
@@ -291,8 +303,8 @@ def complete_order(conn: sqlite3.Connection, o: sqlite3.Row, auto: bool = False,
     conn.execute(
         "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'order', ?, ?)",
         ("u:" + o["user_id"], o["gig_id"],
-         f"{who} по заказу {o['num']}." + (f" Продавцу переведено {rub(net)} (" + (f"комиссия платформы {pct} %: {rub(fee)}" if pct else
-             "без комиссии: первые 2 недели продавца на RUWORK") + ")." if paid else ""), now_ms()),
+         f"{who} по заказу {o['num']}." + (f" Продавцу переведено {rub(net)} (" + (f"комиссия платформы {pct_s(pct)} %: {rub(fee)}" if pct else
+             "без комиссии: первая неделя продавца на RUWORK") + ")." if paid else ""), now_ms()),
     )
     return True
 

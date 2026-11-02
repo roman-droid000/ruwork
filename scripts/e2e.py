@@ -209,7 +209,7 @@ def run(base: str, db: Path, tmp: Path) -> None:
     check("заказ выполнен", buyer.ok("GET", f"/api/orders/{oid}")["status"] == "Выполнен")
     w = seller.ok("GET", "/api/state")["wallet"]
     net = price
-    check(f"продавцу зачислено {net}: первые 2 недели без комиссии", w["earned"] == net, w)
+    check(f"продавцу зачислено {net}: первая неделя без комиссии", w["earned"] == net, w)
     check("в профиле видно, до какого времени комиссия 0 %", bool(seller.ok("GET", "/api/state")["perks"]["fee_free_until"]))
     buyer.ok("POST", f"/api/orders/{oid}/review", {"stars": 5, "text": "Всё отлично, спасибо!"})
     check("отзыв опубликован", len(buyer.ok("GET", f"/api/gigs/{gig['id']}/reviews")) == 1)
@@ -310,10 +310,10 @@ def run(base: str, db: Path, tmp: Path) -> None:
     code, _ = same_ip.call("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
     check("бонусом нельзя оплатить заказ у связанного аккаунта", code == 400)
     pk = seller.ok("GET", "/api/state")["perks"]
-    check("первые 2 недели: комиссия 0 %", pk["fee_now"] == 0 and pk["fee_free_until"], pk)
-    # Продавца пригласил inviter. Продажа на 3-й неделе: комиссия 10 % — пригласившему 1 %, платёжной системе 8 %,
-    # платформе 1 %; после 4 недель: комиссия 15 % — пригласившему 3 %, платёжной системе 8 %, платформе 4 %.
-    buyer.ok("POST", "/api/wallet/deposit", {"amount": price * 3})
+    check("первая неделя: комиссия 0 %", pk["fee_now"] == 0 and pk["fee_free_until"], pk)
+    # Продавца пригласил inviter. Продажа на 2-й неделе: комиссия 9 % — платёжной системе 8,5 %, пригласившему 0,5 %,
+    # платформе 0; после 3 недель: комиссия 11,5 % — платёжной системе 8,5 %, пригласившему 3 % (без пригласившего — платформе).
+    buyer.ok("POST", "/api/wallet/deposit", {"amount": price * 5})
     dep2 = next(o for o in admin.ok("GET", "/api/admin/ops") if o["status"] == "pending" and o["t"] == "dep")
     admin.ok("POST", f"/api/admin/ops/{dep2['id']}/approve")
     sql("UPDATE users SET ref_by = ? WHERE id = ?", inv_id, me_s["id"])
@@ -337,21 +337,30 @@ def run(base: str, db: Path, tmp: Path) -> None:
         return out
 
     got = sale_at(0)
-    check(f"первые 2 недели: продавцу 100 %, платёжной системе 8 % — доплачивает платформа — {got}",
-          got == (price, 0, price * 8 // 100, -(price * 8 // 100)))
-    sql("UPDATE users SET created_at = created_at - 20 * 86400000 WHERE id = ?", me_s["id"])
+    pay = price * 85 // 1000  # 8,5 %
+    check(f"первая неделя: продавцу 100 %, платёжной системе 8,5 % — доплачивает платформа — {got}",
+          got == (price, 0, pay, -pay))
+    sql("UPDATE users SET created_at = created_at - 10 * 86400000 WHERE id = ?", me_s["id"])
     pk = seller.ok("GET", "/api/state")["perks"]
-    check("3-я неделя после регистрации: комиссия 10 %", pk["fee_now"] == 10 and pk["fee_free_until"] is None and pk["fee_low_until"], pk)
-    sql("UPDATE users SET created_at = created_at + 20 * 86400000 WHERE id = ?", me_s["id"])
-    got = sale_at(20)
-    check(f"3-я неделя: продавцу 90 %, пригласившему 1 %, платёжной системе 8 %, платформе 1 % — {got}",
-          got == (price * 90 // 100, price // 100, price * 8 // 100, price // 100))
-    got = sale_at(31)
+    check("2-я неделя после регистрации: комиссия 9 %", pk["fee_now"] == 9 and pk["fee_free_until"] is None and pk["fee_low_until"], pk)
+    sql("UPDATE users SET created_at = created_at + 10 * 86400000 WHERE id = ?", me_s["id"])
+    got = sale_at(10)
+    check(f"2-я неделя: продавцу 91 %, платёжной системе 8,5 %, пригласившему 0,5 %, платформе 0 — {got}",
+          got == (price * 91 // 100, price * 5 // 1000, pay, 0))
+    got = sale_at(22)
     fee = -(-price * meta["sale_fee_pct"] // 100)
-    check(f"после 4 недель: продавцу 85 %, пригласившему 3 %, платёжной системе 8 %, платформе 4 % — {got}",
-          got == (price - fee, price * 3 // 100, price * 8 // 100, fee - price * 3 // 100 - price * 8 // 100))
+    check(f"после 3 недель: продавцу 88,5 %, платёжной системе 8,5 %, пригласившему 3 %, платформе 0 — {got}",
+          got == (price - price * 115 // 1000, price * 3 // 100, pay, 0) and fee == price * 115 // 1000)
     check("реферальный заработок виден в профиле пригласившего",
-          inviter.ok("GET", "/api/state")["perks"]["ref"]["earned"] == price // 100 + price * 3 // 100)
+          inviter.ok("GET", "/api/state")["perks"]["ref"]["earned"] == price * 5 // 1000 + price * 3 // 100)
+    sql("UPDATE users SET ref_by = NULL WHERE id = ?", me_s["id"])
+    got = sale_at(22)
+    check(f"без пригласившего после 3 недель: продавцу 88,5 %, платёжной системе 8,5 %, платформе 3 % — {got}",
+          got == (price - price * 115 // 1000, 0, pay, price * 3 // 100))
+    got = sale_at(10)
+    check(f"без пригласившего на 2-й неделе: продавцу 91 %, платёжной системе 8,5 %, платформе 0,5 % — {got}",
+          got == (price * 91 // 100, 0, pay, price * 5 // 1000))
+    sql("UPDATE users SET ref_by = ? WHERE id = ?", inv_id, me_s["id"])
 
     code, _ = seller.call("POST", "/api/me/ext", {"url": "https://example.com/me", "rating": 4.9, "reviews": 10})
     check("ссылка не с площадки фриланса отклоняется", code == 400)

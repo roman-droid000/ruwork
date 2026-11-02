@@ -5,7 +5,7 @@
   профиле появляется блок «Опыт на других площадках» с рейтингом и числом отзывов.
 - «Поделиться» с бонусом: ссылка на своё объявление несёт ?ref=<id продавца>. Когда по ней придут SHARE_VISITS
   разных посетителей, объявление бесплатно продвигается сутки (не чаще раза в SHARE_COOLDOWN_MS).
-Сниженная комиссия в первые 4 недели, реферальная доля и приветственный бонус — в app/logic.py и app/routes/account.py.
+Сниженная комиссия в первые 3 недели, реферальная доля и приветственный бонус — в app/logic.py и app/routes/account.py.
 """
 
 import hashlib
@@ -39,7 +39,7 @@ def invite(code: str, request: Request, conn: sqlite3.Connection = Depends(get_d
                           " только после вашего подтверждения.", "/og/site.jpg", "/")
     resp = share_page(request, f"{plain(u['name'])} приглашает вас на RUWORK",
                       f"Зарегистрируйтесь по приглашению и получите {WELCOME_BONUS} ₽ на первый заказ. "
-                      "Продавцам — 2 недели без комиссии.", "/og/site.jpg", f"/?inv={code.upper()}#/dashboard")
+                      "Продавцам — неделя без комиссии.", "/og/site.jpg", f"/?inv={code.upper()}#/dashboard")
     resp.headers["Cache-Control"] = "no-store"
     resp.set_cookie(REF_COOKIE, u["id"], max_age=REF_COOKIE_DAYS * 86400, httponly=True, samesite="lax",
                     secure=request.url.scheme == "https", path="/")
