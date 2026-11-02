@@ -142,8 +142,12 @@ def run(base: str, db: Path, tmp: Path) -> None:
 
     step("2. Регистрация и вход")
     pw = "Passw0rd-e2e"
-    for c, name, email in ((seller, "Продавец" + sfx, f"s{sfx}@e2e.test"), (buyer, "Покупатель" + sfx, f"b{sfx}@e2e.test")):
-        c.ok("POST", "/api/auth/register", {"name": name, "email": email, "password": pw, "password2": pw, "terms": True})
+    seller.ok("POST", "/api/auth/register", {"name": "Продавец" + sfx, "email": f"s{sfx}@e2e.test", "password": pw,
+                                             "password2": pw, "terms": True})
+    check("без ссылки-приглашения бонуса нет", seller.ok("GET", "/api/state")["wallet"]["bonus"] == 0)
+    buyer.ok("GET", "/r/" + seller.ok("GET", "/api/state")["perks"]["ref"]["code"])  # покупатель пришёл по приглашению
+    buyer.ok("POST", "/api/auth/register", {"name": "Покупатель" + sfx, "email": f"b{sfx}@e2e.test", "password": pw,
+                                            "password2": pw, "terms": True})
     me_s = seller.ok("GET", "/api/state")["me"]
     me_b = buyer.ok("GET", "/api/state")["me"]
     check("оба аккаунта созданы", bool(me_s and me_b))
@@ -182,7 +186,7 @@ def run(base: str, db: Path, tmp: Path) -> None:
     check("баланс пополнен", buyer.ok("GET", "/api/state")["wallet"]["coins"] == price * 4)
 
     step("6. Заказ → результат → доработка → подтверждение")
-    check("новому покупателю начислен бонус", buyer.ok("GET", "/api/state")["wallet"]["bonus"] == meta["welcome_bonus"])
+    check("пришедшему по ссылке-приглашению начислен бонус", buyer.ok("GET", "/api/state")["wallet"]["bonus"] == meta["welcome_bonus"])
     buyer.ok("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
     wb = buyer.ok("GET", "/api/state")["wallet"]
     check("бонус списан первым, остальное — монетами",
@@ -205,7 +209,7 @@ def run(base: str, db: Path, tmp: Path) -> None:
     check("заказ выполнен", buyer.ok("GET", f"/api/orders/{oid}")["status"] == "Выполнен")
     w = seller.ok("GET", "/api/state")["wallet"]
     net = price
-    check(f"продавцу зачислено {net}: первый месяц без комиссии", w["earned"] == net, w)
+    check(f"продавцу зачислено {net}: первые 2 недели без комиссии", w["earned"] == net, w)
     check("в профиле видно, до какого времени комиссия 0 %", bool(seller.ok("GET", "/api/state")["perks"]["fee_free_until"]))
     buyer.ok("POST", f"/api/orders/{oid}/review", {"stars": 5, "text": "Всё отлично, спасибо!"})
     check("отзыв опубликован", len(buyer.ok("GET", f"/api/gigs/{gig['id']}/reviews")) == 1)
@@ -213,6 +217,7 @@ def run(base: str, db: Path, tmp: Path) -> None:
     step("7. Вывод заработка")
     seller.ok("POST", "/api/wallet/withdraw", {"amount": 500, "phone": "+79001234567", "bank": "Сбербанк", "password": pw})
     wd = next(o for o in admin.ok("GET", "/api/admin/ops") if o["status"] == "pending" and o["t"] == "wd")
+    check("комиссия за вывод 5 %: с 500 монет — 25", wd["fee"] == 25, wd)
     admin.ok("POST", f"/api/admin/ops/{wd['id']}/approve")
     check("вывод одобрен", seller.ok("GET", "/api/state")["wallet"]["earned"] == net - 500)
 
@@ -269,7 +274,7 @@ def run(base: str, db: Path, tmp: Path) -> None:
     code, _ = admin.call("POST", f"/api/admin/ideas/{ideas[0]['id']}/status", {"status": "bogus"})
     check("неизвестный статус отклоняется", code == 400)
 
-    step("10б. Привлечение: рефералы, комиссия после первого месяца, опыт с площадок, «Поделиться», SEO")
+    step("10б. Привлечение: рефералы, ступени комиссии новичка, опыт с площадок, «Поделиться», SEO")
     inviter = Client(base, "10.0.2.1")
     inviter.ok("POST", "/api/auth/register", {"name": "Пригласивший" + sfx, "email": f"i{sfx}@e2e.test", "password": pw,
                                               "password2": pw, "terms": True})
@@ -284,34 +289,69 @@ def run(base: str, db: Path, tmp: Path) -> None:
                                              "password2": pw, "terms": True})
     pr = inviter.ok("GET", "/api/state")["perks"]["ref"]
     check("пришедший по ссылке закреплён за пригласившим", pr["invited"] == 1 and pr["list"][0]["name"] == "Друг" + sfx, pr)
+    check("и получил бонус", friend.ok("GET", "/api/state")["wallet"]["bonus"] == meta["welcome_bonus"])
     c3, page = Client(base, "10.0.2.3").call("GET", "/r/NOPE99")
     check("неверный код — обычная главная", c3 == 200 and "приглашает" not in page)
     self_inv = Client(base, "10.0.2.1")  # тот же адрес, что у пригласившего
     self_inv.ok("GET", f"/r/{code}")
     self_inv.ok("POST", "/api/auth/register", {"name": "Сам" + sfx, "email": f"m{sfx}@e2e.test", "password": pw,
                                                "password2": pw, "terms": True})
-    check("второй аккаунт с адреса пригласившего не закрепляется", inviter.ok("GET", "/api/state")["perks"]["ref"]["invited"] == 1)
-    same_ip = Client(base, "10.0.0.1")  # тот же адрес, что у продавца
+    check("второй аккаунт с адреса пригласившего не закрепляется и без бонуса",
+          inviter.ok("GET", "/api/state")["perks"]["ref"]["invited"] == 1 and self_inv.ok("GET", "/api/state")["wallet"]["bonus"] == 0)
+    via_share = Client(base, "10.0.2.4")
+    via_share.ok("POST", "/api/auth/register", {"name": "Гость" + sfx, "email": f"g{sfx}@e2e.test", "password": pw,
+                                                "password2": pw, "terms": True, "ref": inv_id})
+    check("по ссылке «Поделиться» закрепляется, но без бонуса",
+          inviter.ok("GET", "/api/state")["perks"]["ref"]["invited"] == 2 and via_share.ok("GET", "/api/state")["wallet"]["bonus"] == 0)
+    same_ip = Client(base, "10.0.0.1")  # тот же адрес, что у продавца; пришёл по приглашению — бонус есть
+    same_ip.ok("GET", f"/r/{code}")
     same_ip.ok("POST", "/api/auth/register", {"name": "Близнец" + sfx, "email": f"z{sfx}@e2e.test", "password": pw,
                                               "password2": pw, "terms": True})
     code, _ = same_ip.call("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
     check("бонусом нельзя оплатить заказ у связанного аккаунта", code == 400)
-    # Продавцу больше месяца, его пригласил inviter: комиссия 5 %, из неё 10 % — пригласившему.
-    sql("UPDATE users SET created_at = created_at - 31 * 86400000, ref_by = ? WHERE id = ?", inv_id, me_s["id"])
-    earned0 = seller.ok("GET", "/api/state")["wallet"]["earned"]
-    buyer.ok("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
-    oid3 = buyer.ok("GET", "/api/state")["orders"][0][5]
-    sql("UPDATE orders SET created_at = created_at - 61000 WHERE id = ?", oid3)
-    buyer.ok("GET", "/api/state")
-    f3 = seller.ok("POST", f"/api/orders/{oid3}/files", {"name": "r.txt", "size": 3, "mime": "text/plain"})
-    seller.ok("PUT", f"/api/orders/{oid3}/files/{f3['id']}?offset=0", raw=b"r v", ctype="application/octet-stream")
-    buyer.ok("POST", f"/api/orders/{oid3}/confirm")
+    pk = seller.ok("GET", "/api/state")["perks"]
+    check("первые 2 недели: комиссия 0 %", pk["fee_now"] == 0 and pk["fee_free_until"], pk)
+    # Продавца пригласил inviter. Продажа на 3-й неделе: комиссия 10 % — пригласившему 1 %, платёжной системе 8 %,
+    # платформе 1 %; после 4 недель: комиссия 15 % — пригласившему 3 %, платёжной системе 8 %, платформе 4 %.
+    buyer.ok("POST", "/api/wallet/deposit", {"amount": price * 3})
+    dep2 = next(o for o in admin.ok("GET", "/api/admin/ops") if o["status"] == "pending" and o["t"] == "dep")
+    admin.ok("POST", f"/api/admin/ops/{dep2['id']}/approve")
+    sql("UPDATE users SET ref_by = ? WHERE id = ?", inv_id, me_s["id"])
+
+    def sale_at(days: int) -> tuple[int, int, int, int]:
+        """Продажа на `price`, когда продавцу `days` дней: (+продавцу, +пригласившему, +платёжной системе, +платформе)."""
+        sql("UPDATE users SET created_at = created_at - ? WHERE id = ?", days * 86400000, me_s["id"])
+        s0, r0 = seller.ok("GET", "/api/state")["wallet"]["earned"], inviter.ok("GET", "/api/state")["wallet"]["earned"]
+        pl0 = admin.ok("GET", "/api/admin/platform")
+        buyer.ok("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
+        o = buyer.ok("GET", "/api/state")["orders"][0][5]
+        sql("UPDATE orders SET created_at = created_at - 61000 WHERE id = ?", o)
+        buyer.ok("GET", "/api/state")
+        f = seller.ok("POST", f"/api/orders/{o}/files", {"name": "r.txt", "size": 3, "mime": "text/plain"})
+        seller.ok("PUT", f"/api/orders/{o}/files/{f['id']}?offset=0", raw=b"r v", ctype="application/octet-stream")
+        buyer.ok("POST", f"/api/orders/{o}/confirm")
+        out = (seller.ok("GET", "/api/state")["wallet"]["earned"] - s0, inviter.ok("GET", "/api/state")["wallet"]["earned"] - r0,
+               admin.ok("GET", "/api/admin/platform")["pay_sys"] - pl0["pay_sys"],
+               admin.ok("GET", "/api/admin/platform")["coins"] - pl0["coins"])
+        sql("UPDATE users SET created_at = created_at + ? WHERE id = ?", days * 86400000, me_s["id"])  # продавец снова новый
+        return out
+
+    got = sale_at(0)
+    check(f"первые 2 недели: продавцу 100 %, платёжной системе 8 % — доплачивает платформа — {got}",
+          got == (price, 0, price * 8 // 100, -(price * 8 // 100)))
+    sql("UPDATE users SET created_at = created_at - 20 * 86400000 WHERE id = ?", me_s["id"])
+    pk = seller.ok("GET", "/api/state")["perks"]
+    check("3-я неделя после регистрации: комиссия 10 %", pk["fee_now"] == 10 and pk["fee_free_until"] is None and pk["fee_low_until"], pk)
+    sql("UPDATE users SET created_at = created_at + 20 * 86400000 WHERE id = ?", me_s["id"])
+    got = sale_at(20)
+    check(f"3-я неделя: продавцу 90 %, пригласившему 1 %, платёжной системе 8 %, платформе 1 % — {got}",
+          got == (price * 90 // 100, price // 100, price * 8 // 100, price // 100))
+    got = sale_at(31)
     fee = -(-price * meta["sale_fee_pct"] // 100)
-    check(f"после первого месяца комиссия {meta['sale_fee_pct']} %",
-          seller.ok("GET", "/api/state")["wallet"]["earned"] == earned0 + price - fee)
-    ri = inviter.ok("GET", "/api/state")
-    sql("UPDATE users SET created_at = created_at + 31 * 86400000 WHERE id = ?", me_s["id"])  # дальше продавец снова новый
-    check("пригласивший получил долю комиссии", ri["wallet"]["earned"] == fee * 10 // 100 and ri["perks"]["ref"]["earned"] == fee * 10 // 100, ri["wallet"])
+    check(f"после 4 недель: продавцу 85 %, пригласившему 3 %, платёжной системе 8 %, платформе 4 % — {got}",
+          got == (price - fee, price * 3 // 100, price * 8 // 100, fee - price * 3 // 100 - price * 8 // 100))
+    check("реферальный заработок виден в профиле пригласившего",
+          inviter.ok("GET", "/api/state")["perks"]["ref"]["earned"] == price // 100 + price * 3 // 100)
 
     code, _ = seller.call("POST", "/api/me/ext", {"url": "https://example.com/me", "rating": 4.9, "reviews": 10})
     check("ссылка не с площадки фриланса отклоняется", code == 400)
@@ -330,7 +370,12 @@ def run(base: str, db: Path, tmp: Path) -> None:
         if i == 3:
             check("4 перехода — продвижения ещё нет", seller.ok("GET", "/api/me/share")[gig["id"]]["n"] == 4)
     g_after = next(g for g in buyer.ok("GET", "/api/gigs") if g["id"] == gig["id"])
-    check("5 переходов по ссылке — бесплатные сутки продвижения", g_after["promo"] is True)
+    left = g_after["promo_until"] - int(time.time() * 1000)
+    check("5 переходов по ссылке — бесплатные сутки продвижения", g_after["promo"] is True and 0.9 * 86400000 < left <= 86400000, left)
+    seller.ok("POST", f"/api/gigs/{gig['id']}/promote")
+    g_p = next(g for g in buyer.ok("GET", "/api/gigs") if g["id"] == gig["id"])
+    check("платное продвижение за 99 монет продлевает ещё на неделю",
+          abs(g_p["promo_until"] - g_after["promo_until"] - 7 * 86400000) < 5000, g_p["promo_until"] - g_after["promo_until"])
     check("следующее бесплатное продвижение — через 30 дней", bool(seller.ok("GET", "/api/me/share")[gig["id"]]["next"]))
     code, page = buyer.call("GET", f"/g/{gig['id']}?ref={me_s['id']}")
     check("ссылка «Поделиться» передаёт ref", code == 200 and f"/?ref={me_s['id']}#/gig/{gig['id']}" in page)

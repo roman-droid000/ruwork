@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from .. import auth
 from ..db import get_db, now_ms, tx
 from ..logic import (
-    DAY_MS, SOLD_SQL, ST_DISPUTE, ST_DONE, add_coins, audit, gig_out, nf, notify, platform_add, resolve_dispute,
+    DAY_MS, PAY_SYS_PCT, SOLD_SQL, ST_DISPUTE, ST_DONE, add_coins, audit, gig_out, nf, notify, platform_add, resolve_dispute,
 )
 from .market import notify_searches
 from .orders import remove_cover
@@ -110,15 +110,16 @@ def op_decide(op_id: str, act: str, staff=Depends(auth.require_admin), conn: sql
 
 @router.get("/platform", dependencies=admin_only)
 def platform(conn: sqlite3.Connection = Depends(get_db)):
-    """Баланс платформы: комиссии за вывод и с продаж, доля удержания при отмене заказов «В работе»."""
+    """Баланс платформы: комиссии за вывод и с продаж, доля удержания при отмене заказов «В работе».
+    Комиссия платёжной системы (kind = "pay_sys") в баланс не входит и возвращается отдельно."""
     by = {r["kind"]: r["s"] for r in conn.execute("SELECT kind, sum(coins) AS s FROM platform_ops GROUP BY kind")}
-    ops = conn.execute(
-        "SELECT p.kind, p.coins, p.note, p.ts, u.name FROM platform_ops p LEFT JOIN users u ON u.id = p.user_id"
-        " ORDER BY p.id DESC LIMIT 30"
-    ).fetchall()
+    q = ("SELECT p.kind, p.coins, p.note, p.ts, u.name FROM platform_ops p LEFT JOIN users u ON u.id = p.user_id"
+         " WHERE p.kind {} 'pay_sys' ORDER BY p.id DESC LIMIT 30")
+    ops, pay_ops = conn.execute(q.format("!=")).fetchall(), conn.execute(q.format("=")).fetchall()
+    pay = by.pop("pay_sys", 0)
     return {"coins": sum(by.values()), "wd_fee": by.get("wd_fee", 0), "cancel": by.get("cancel", 0), "sale_fee": by.get("sale_fee", 0),
-            "promo": by.get("promo", 0),
-            "ops": [dict(r) for r in ops]}
+            "promo": by.get("promo", 0), "pay_cover": by.get("pay_cover", 0), "ops": [dict(r) for r in ops],
+            "pay_sys": pay, "pay_sys_pct": PAY_SYS_PCT, "pay_ops": [dict(r) for r in pay_ops]}
 
 
 # ---------- Сброс пароля ----------

@@ -125,7 +125,7 @@ def stats(days: int = 30, conn: sqlite3.Connection = Depends(get_db)):
 
     put("turnover", conn.execute("SELECT created_at, amount FROM orders WHERE created_at >= ? AND status != 'Отменён'", (since,)))
     put("orders", conn.execute("SELECT created_at, 1 FROM orders WHERE created_at >= ?", (since,)))
-    put("fee", conn.execute("SELECT ts, coins FROM platform_ops WHERE ts >= ?", (since,)))
+    put("fee", conn.execute("SELECT ts, coins FROM platform_ops WHERE ts >= ? AND kind != 'pay_sys'", (since,)))
     put("users", conn.execute("SELECT created_at, 1 FROM users WHERE created_at >= ?", (since,)))
     put("gigs", conn.execute("SELECT created_at, 1 FROM gigs WHERE created_at >= ? AND owner_id IS NOT NULL", (since,)))
     one = lambda q, *a: conn.execute(q, a).fetchone()[0]

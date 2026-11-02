@@ -115,20 +115,24 @@ def check_reg_code(conn: sqlite3.Connection, request: Request, code: str) -> sql
     return r
 
 
-def welcome(conn: sqlite3.Connection, user_id: str, name: str, ref: str, ip: str = "") -> None:
-    """Новому аккаунту — приветственный бонус на заказы. Если он пришёл по приглашению (cookie со ссылки /r/<код>
-    или ref из ссылки «Поделиться»), закрепляется за пригласившим — кроме регистрации с адреса, с которого входил
-    сам пригласивший (второй аккаунт того же человека)."""
-    add_bonus(conn, user_id, WELCOME_BONUS)
-    add_op(conn, user_id, "bonus", "bal", WELCOME_BONUS, "done", "Приветственный бонус на заказы")
+def welcome(conn: sqlite3.Connection, user_id: str, name: str, invite: str, share_ref: str, ip: str = "") -> None:
+    """Регистрация по приглашению. invite — id из cookie ссылки-приглашения /r/<код>: такой пользователь закрепляется
+    за пригласившим и получает приветственный бонус на заказы. share_ref — id из ссылки «Поделиться» (/g/…?ref=):
+    закрепляет за поделившимся, но без бонуса. Ни то, ни другое не срабатывает при регистрации с адреса,
+    с которого входил сам пригласивший (второй аккаунт того же человека)."""
+    ref = invite or share_ref
     inviter = conn.execute("SELECT id FROM users WHERE id = ? AND id != ? AND blocked_at IS NULL AND deleted_at IS NULL",
                            (ref[:40], user_id)).fetchone() if ref else None
     if inviter and ip and conn.execute("SELECT 1 FROM user_ips WHERE user_id = ? AND ip = ?", (inviter["id"], ip)).fetchone():
         inviter = None
-    if inviter:
-        conn.execute("UPDATE users SET ref_by = ? WHERE id = ?", (inviter["id"], user_id))
-        notify(conn, inviter["id"], "ref", f"По вашей ссылке зарегистрировался {html.unescape(name)}. Полгода вы будете"
-               " получать долю комиссии с его продаж.", "#/dashboard/profile")
+    if not inviter:
+        return
+    conn.execute("UPDATE users SET ref_by = ? WHERE id = ?", (inviter["id"], user_id))
+    notify(conn, inviter["id"], "ref", f"По вашей ссылке зарегистрировался {html.unescape(name)}. Полгода вы будете"
+           " получать долю комиссии с его продаж.", "#/dashboard/profile")
+    if invite and inviter["id"] == invite:
+        add_bonus(conn, user_id, WELCOME_BONUS)
+        add_op(conn, user_id, "bonus", "bal", WELCOME_BONUS, "done", "Бонус за регистрацию по приглашению")
 
 
 @router.post("/auth/register")
@@ -177,7 +181,7 @@ def register(body: RegisterIn, request: Request, response: Response, conn: sqlit
         )
         if via_tg:
             conn.execute("DELETE FROM tg_regs WHERE chat_id = ?", (chat,))
-        welcome(conn, user_id, name, request.cookies.get("ruwork_ref", "") or body.ref.strip()[:40],
+        welcome(conn, user_id, name, request.cookies.get("ruwork_ref", "")[:40], body.ref.strip()[:40],
                 guard.client_ip(request))
         auth.start_session(conn, response, user_id)
         auth.remember_ip(conn, user_id, guard.client_ip(request))

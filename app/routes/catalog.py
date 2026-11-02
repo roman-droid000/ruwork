@@ -166,7 +166,7 @@ def bump_gig(gig_id: str, user=Depends(auth.require_user), conn: sqlite3.Connect
 
 @router.post("/gigs/{gig_id}/promote")
 def promote_gig(gig_id: str, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
-    """Платное продвижение на сутки: объявление показывается выше всех с меткой «Продвигается».
+    """Платное продвижение на неделю (PROMO_MS): объявление показывается выше всех с меткой «Продвигается».
     Повторная покупка продлевает срок. Монеты уходят на баланс платформы."""
     with tx(conn):
         g = own_gig(conn, gig_id, user)

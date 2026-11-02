@@ -5,7 +5,7 @@
   профиле появляется блок «Опыт на других площадках» с рейтингом и числом отзывов.
 - «Поделиться» с бонусом: ссылка на своё объявление несёт ?ref=<id продавца>. Когда по ней придут SHARE_VISITS
   разных посетителей, объявление бесплатно продвигается сутки (не чаще раза в SHARE_COOLDOWN_MS).
-Комиссия 0 % в первый месяц, реферальная доля и приветственный бонус — в app/logic.py и app/routes/account.py.
+Сниженная комиссия в первые 4 недели, реферальная доля и приветственный бонус — в app/logic.py и app/routes/account.py.
 """
 
 import hashlib
@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from .. import auth, guard
 from ..db import get_db, now_ms, tx
-from ..logic import PROMO_MS, SHARE_COOLDOWN_MS, SHARE_VISITS, WELCOME_BONUS, audit, esc, notify
+from ..logic import SHARE_PROMO_MS, SHARE_COOLDOWN_MS, SHARE_VISITS, WELCOME_BONUS, audit, esc, notify
 from .share import plain, share_page
 
 router = APIRouter(prefix="/api")
@@ -39,7 +39,7 @@ def invite(code: str, request: Request, conn: sqlite3.Connection = Depends(get_d
                           " только после вашего подтверждения.", "/og/site.jpg", "/")
     resp = share_page(request, f"{plain(u['name'])} приглашает вас на RUWORK",
                       f"Зарегистрируйтесь по приглашению и получите {WELCOME_BONUS} ₽ на первый заказ. "
-                      "Продавцам — первый месяц без комиссии.", "/og/site.jpg", f"/?inv={code.upper()}#/dashboard")
+                      "Продавцам — 2 недели без комиссии.", "/og/site.jpg", f"/?inv={code.upper()}#/dashboard")
     resp.headers["Cache-Control"] = "no-store"
     resp.set_cookie(REF_COOKIE, u["id"], max_age=REF_COOKIE_DAYS * 86400, httponly=True, samesite="lax",
                     secure=request.url.scheme == "https", path="/")
@@ -173,7 +173,7 @@ def share_visit(body: VisitIn, request: Request, user=Depends(auth.optional_user
         cnt = conn.execute("SELECT count(*) FROM share_visits WHERE gig_id = ? AND ts > ?", (g["id"], since)).fetchone()[0]
         if cnt >= SHARE_VISITS:
             conn.execute("UPDATE gigs SET promo_until = ?, bumped_at = ?, share_reward_at = ? WHERE id = ?",
-                         (max(n, g["promo_until"] or 0) + PROMO_MS, n, n, g["id"]))
+                         (max(n, g["promo_until"] or 0) + SHARE_PROMO_MS, n, n, g["id"]))
             notify(conn, g["owner_id"], "promo", f"По вашей ссылке пришли {cnt} человек — объявление «{g['title']}» бесплатно"
                    " продвигается сутки.", f"#/gig/{g['id']}")
     return {"ok": True}

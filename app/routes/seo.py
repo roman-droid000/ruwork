@@ -78,7 +78,7 @@ def page(title: str, desc: str, path: str, crumbs: list[tuple[str, str]], body: 
 <header><a class="logo" href="/">RUWORK</a><nav><a class="btn o" href="/#/catalog">Каталог услуг</a></nav></header>
 <div class="crumbs">{cr}</div>{body}
 <div class="box"><b style="font-size:20px">Не нашли подходящую услугу?</b><p>Опишите задачу на бирже заданий — продавцы сами предложат цену и срок. Оплата через безопасную сделку: деньги продавец получит только после вашего подтверждения.</p><a class="btn" style="background:#fff;color:#1E1B2E" href="/?req=1#/requests">Разместить задание</a></div>
-<div class="box" style="background:linear-gradient(120deg,#123F2E,#1F7A5A 55%,#4CC38A)"><b style="font-size:20px">Вы фрилансер?</b><p>Разместите услугу на RUWORK за 5 минут. Первый месяц — без комиссии с продаж.</p><a class="btn" style="background:#fff;color:#1E1B2E" href="/#/dashboard/gigs">Стать продавцом</a></div>
+<div class="box" style="background:linear-gradient(120deg,#123F2E,#1F7A5A 55%,#4CC38A)"><b style="font-size:20px">Вы фрилансер?</b><p>Разместите услугу на RUWORK за 5 минут. Первые 2 недели — без комиссии с продаж.</p><a class="btn" style="background:#fff;color:#1E1B2E" href="/#/dashboard/gigs">Стать продавцом</a></div>
 <footer><a href="/uslugi">Все услуги</a> · <a href="/#/help">Как проходит сделка</a> · <a href="/#/support">Поддержка</a> · RUWORK — маркетплейс фриланс-услуг</footer>
 </main></body></html>"""
     return HTMLResponse(out, headers={"Cache-Control": "public, max-age=600"})
