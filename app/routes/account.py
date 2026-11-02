@@ -115,12 +115,16 @@ def check_reg_code(conn: sqlite3.Connection, request: Request, code: str) -> sql
     return r
 
 
-def welcome(conn: sqlite3.Connection, user_id: str, name: str, ref: str) -> None:
-    """Новому аккаунту — приветственный бонус на заказы; пригласившему — уведомление и связь для реферальной доли."""
+def welcome(conn: sqlite3.Connection, user_id: str, name: str, ref: str, ip: str = "") -> None:
+    """Новому аккаунту — приветственный бонус на заказы. Если он пришёл по приглашению (cookie со ссылки /r/<код>
+    или ref из ссылки «Поделиться»), закрепляется за пригласившим — кроме регистрации с адреса, с которого входил
+    сам пригласивший (второй аккаунт того же человека)."""
     add_bonus(conn, user_id, WELCOME_BONUS)
     add_op(conn, user_id, "bonus", "bal", WELCOME_BONUS, "done", "Приветственный бонус на заказы")
-    inviter = conn.execute("SELECT id FROM users WHERE id = ? AND blocked_at IS NULL AND deleted_at IS NULL",
-                           (ref,)).fetchone() if ref else None
+    inviter = conn.execute("SELECT id FROM users WHERE id = ? AND id != ? AND blocked_at IS NULL AND deleted_at IS NULL",
+                           (ref[:40], user_id)).fetchone() if ref else None
+    if inviter and ip and conn.execute("SELECT 1 FROM user_ips WHERE user_id = ? AND ip = ?", (inviter["id"], ip)).fetchone():
+        inviter = None
     if inviter:
         conn.execute("UPDATE users SET ref_by = ? WHERE id = ?", (inviter["id"], user_id))
         notify(conn, inviter["id"], "ref", f"По вашей ссылке зарегистрировался {html.unescape(name)}. Полгода вы будете"
@@ -173,9 +177,11 @@ def register(body: RegisterIn, request: Request, response: Response, conn: sqlit
         )
         if via_tg:
             conn.execute("DELETE FROM tg_regs WHERE chat_id = ?", (chat,))
-        welcome(conn, user_id, name, body.ref.strip()[:40])
+        welcome(conn, user_id, name, request.cookies.get("ruwork_ref", "") or body.ref.strip()[:40],
+                guard.client_ip(request))
         auth.start_session(conn, response, user_id)
         auth.remember_ip(conn, user_id, guard.client_ip(request))
+    response.delete_cookie("ruwork_ref", path="/")
     if via_tg:
         response.delete_cookie(REG_COOKIE, path="/")
         tg.send(chat, f"Аккаунт RUWORK «{name}» создан. Входите на сайте по номеру {phone} и паролю. Сюда будут "

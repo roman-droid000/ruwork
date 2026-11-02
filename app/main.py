@@ -28,6 +28,7 @@ app = FastAPI(title="RUWORK", lifespan=lifespan, docs_url="/api/docs", openapi_u
 for module in (account, catalog, money, chat, admin, admin_tools, orders, reviews, share, social, tgapp, market, reports, ideas, growth, seo, delete_account):
     app.include_router(module.router)
 app.include_router(admin_tools.mfa_router)
+app.include_router(growth.pub)
 
 
 @app.exception_handler(Exception)

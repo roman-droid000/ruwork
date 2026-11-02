@@ -274,10 +274,23 @@ def run(base: str, db: Path, tmp: Path) -> None:
     inviter.ok("POST", "/api/auth/register", {"name": "Пригласивший" + sfx, "email": f"i{sfx}@e2e.test", "password": pw,
                                               "password2": pw, "terms": True})
     inv_id = inviter.ok("GET", "/api/state")["me"]["id"]
+    code = inviter.ok("GET", "/api/state")["perks"]["ref"]["code"]
+    check("у аккаунта есть код ссылки-приглашения", len(code) == 6 and code == inviter.ok("GET", "/api/state")["perks"]["ref"]["code"])
     friend = Client(base, "10.0.2.2")
+    c2, page = friend.call("GET", f"/r/{code}")
+    check("ссылка-приглашение: превью с именем и переход к регистрации",
+          c2 == 200 and "приглашает вас на RUWORK" in page and f"/?inv={code}#/dashboard" in page)
     friend.ok("POST", "/api/auth/register", {"name": "Друг" + sfx, "email": f"f{sfx}@e2e.test", "password": pw,
-                                             "password2": pw, "terms": True, "ref": inv_id})
-    check("приглашённый засчитан", inviter.ok("GET", "/api/state")["perks"]["ref"]["invited"] == 1)
+                                             "password2": pw, "terms": True})
+    pr = inviter.ok("GET", "/api/state")["perks"]["ref"]
+    check("пришедший по ссылке закреплён за пригласившим", pr["invited"] == 1 and pr["list"][0]["name"] == "Друг" + sfx, pr)
+    c3, page = Client(base, "10.0.2.3").call("GET", "/r/NOPE99")
+    check("неверный код — обычная главная", c3 == 200 and "приглашает" not in page)
+    self_inv = Client(base, "10.0.2.1")  # тот же адрес, что у пригласившего
+    self_inv.ok("GET", f"/r/{code}")
+    self_inv.ok("POST", "/api/auth/register", {"name": "Сам" + sfx, "email": f"m{sfx}@e2e.test", "password": pw,
+                                               "password2": pw, "terms": True})
+    check("второй аккаунт с адреса пригласившего не закрепляется", inviter.ok("GET", "/api/state")["perks"]["ref"]["invited"] == 1)
     same_ip = Client(base, "10.0.0.1")  # тот же адрес, что у продавца
     same_ip.ok("POST", "/api/auth/register", {"name": "Близнец" + sfx, "email": f"z{sfx}@e2e.test", "password": pw,
                                               "password2": pw, "terms": True})

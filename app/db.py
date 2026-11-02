@@ -501,6 +501,9 @@ def init_db() -> None:
             conn.execute("ALTER TABLE users ADD COLUMN ext_note TEXT NOT NULL DEFAULT ''")
             conn.execute("ALTER TABLE users ADD COLUMN ext_at INTEGER")
         conn.execute("CREATE INDEX IF NOT EXISTS users_ref ON users(ref_by)")
+        if "ref_code" not in {r[1] for r in conn.execute("PRAGMA table_info(users)")}:
+            conn.execute("ALTER TABLE users ADD COLUMN ref_code TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_ref_code ON users(ref_code) WHERE ref_code IS NOT NULL")
         if "share_reward_at" not in {r[1] for r in conn.execute("PRAGMA table_info(gigs)")}:
             conn.execute("ALTER TABLE gigs ADD COLUMN share_reward_at INTEGER")
         for sub in ("covers", "results", "avatars", "reviews", "portfolio"):

@@ -371,6 +371,21 @@ def user_state(conn: sqlite3.Connection, user_id: str) -> dict:
     }
 
 
+REF_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # без похожих O/0, I/1/L
+
+
+def ref_code(conn: sqlite3.Connection, user_id: str) -> str:
+    """Код ссылки-приглашения /r/<код>: создаётся при первом обращении и дальше не меняется."""
+    r = conn.execute("SELECT ref_code FROM users WHERE id = ?", (user_id,)).fetchone()
+    if r and r["ref_code"]:
+        return r["ref_code"]
+    while True:
+        code = "".join(secrets.choice(REF_ALPHABET) for _ in range(6))
+        if not conn.execute("SELECT 1 FROM users WHERE ref_code = ?", (code,)).fetchone():
+            conn.execute("UPDATE users SET ref_code = ? WHERE id = ?", (code, user_id))
+            return code
+
+
 def perks(conn: sqlite3.Connection, user_id: str) -> dict:
     """Условия для продавца: до какого времени комиссия 0 %, приглашённые и доход с них, проверка опыта."""
     u = conn.execute("SELECT created_at, ext_url, ext_site, ext_rating, ext_reviews, ext_status, ext_note"
@@ -380,7 +395,10 @@ def perks(conn: sqlite3.Connection, user_id: str) -> dict:
                           (user_id,)).fetchone()[0]
     free_until = u["created_at"] + FEE_FREE_MS
     return {"fee_free_until": free_until if free_until > now_ms() else None, "fee_pct": SALE_FEE_PCT,
-            "ref": {"invited": invited, "earned": earned, "pct": REF_PCT},
+            "ref": {"invited": invited, "earned": earned, "pct": REF_PCT, "code": ref_code(conn, user_id),
+                    "list": [dict(r) for r in conn.execute(
+                        "SELECT name, created_at AS ts FROM users WHERE ref_by = ? AND deleted_at IS NULL"
+                        " ORDER BY created_at DESC LIMIT 20", (user_id,))]},
             "ext": {k: u["ext_" + k] for k in ("url", "site", "rating", "reviews", "status", "note")}}
 
 
