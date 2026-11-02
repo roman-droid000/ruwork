@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from . import guard, jobs, tg
 from .db import ROOT, connect, init_db
-from .routes import account, admin, admin_tools, catalog, delete_account, chat, ideas, market, money, orders, reports, reviews, share, social, tgapp
+from .routes import account, admin, admin_tools, catalog, delete_account, chat, growth, ideas, market, money, orders, reports, reviews, seo, share, social, tgapp
 
 PUBLIC = (ROOT / "public").resolve()
 
@@ -25,7 +25,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="RUWORK", lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json")
-for module in (account, catalog, money, chat, admin, admin_tools, orders, reviews, share, social, tgapp, market, reports, ideas, delete_account):
+for module in (account, catalog, money, chat, admin, admin_tools, orders, reviews, share, social, tgapp, market, reports, ideas, growth, seo, delete_account):
     app.include_router(module.router)
 app.include_router(admin_tools.mfa_router)
 

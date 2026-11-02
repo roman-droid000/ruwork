@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from .. import auth, guard, tg
 from ..db import SEED, get_db, now_ms, tx
 from ..logic import (
-    BUMP_MS, CATS, DEMO_CATALOG, PREMOD_FIRST, setting, MINP, PROMO_MS, PROMO_PRICE, SALE_FEE_PCT, SBP_ORDERS, SOLD_SQL, SUBS, VISIBLE_SQL, add_op, esc, get_coins,
+    BUMP_MS, CATS, DEMO_CATALOG, WELCOME_BONUS, PREMOD_FIRST, setting, MINP, PROMO_MS, PROMO_PRICE, SALE_FEE_PCT, SBP_ORDERS, SOLD_SQL, SUBS, VISIBLE_SQL, add_op, esc, get_coins,
     gig_is_top, gig_out, platform_add, response_times, rub, seller_level, seller_ratings, spend, user_state,
 )
 from .market import notify_searches
@@ -36,7 +36,7 @@ def meta(conn: sqlite3.Connection = Depends(get_db)):
     } if DEMO_CATALOG else {}
     return {"cats": SEED["cats"], "subs": SUBS, "minp": MINP, "syn": SEED["syn"], "sellers": sellers,
             "sbp_orders": SBP_ORDERS, "sale_fee_pct": SALE_FEE_PCT, "tg_on": bool(tg.TOKEN), "tg_bot": tg.username,
-            "promo_price": PROMO_PRICE, "bump_ms": BUMP_MS, "report_reasons": REASONS,
+            "promo_price": PROMO_PRICE, "welcome_bonus": WELCOME_BONUS, "bump_ms": BUMP_MS, "report_reasons": REASONS,
             "reg_tg": bool(tg.TOKEN)}
 
 

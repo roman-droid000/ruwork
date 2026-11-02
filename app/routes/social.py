@@ -61,8 +61,8 @@ def change_about(body: AboutIn, user=Depends(auth.require_user), conn: sqlite3.C
 @router.get("/sellers/{user_id}")
 def seller_profile(user_id: str, conn: sqlite3.Connection = Depends(get_db)):
     """Публичный профиль продавца: без email и баланса."""
-    u = conn.execute("SELECT id, name, about, avatar, created_at, blocked_at, last_seen, verified, vacation_until, vacation_note"
-                     " FROM users WHERE id = ?",
+    u = conn.execute("SELECT id, name, about, avatar, created_at, blocked_at, last_seen, verified, vacation_until, vacation_note,"
+                     " ext_url, ext_site, ext_rating, ext_reviews, ext_status FROM users WHERE id = ?",
                      (user_id,)).fetchone()
     if not u or u["blocked_at"] is not None:
         raise HTTPException(404, "Продавец не найден")
@@ -87,7 +87,9 @@ def seller_profile(user_id: str, conn: sqlite3.Connection = Depends(get_db)):
             "calm_pct": round(100 * calm / closed) if closed else None,
             "level": lvl["name"], "level_idx": lvl["idx"], "on_time": lvl["stats"]["on_time"] if lvl["stats"]["done"] else None,
             "away": u["vacation_until"] if (u["vacation_until"] or 0) > now_ms() else None, "away_note": u["vacation_note"],
-            "portfolio": portfolio(conn, user_id)}
+            "portfolio": portfolio(conn, user_id),
+            "ext": {"site": u["ext_site"], "url": u["ext_url"], "rating": u["ext_rating"], "reviews": u["ext_reviews"]}
+            if u["ext_status"] == "ok" else None}
 
 
 # Telegram сотрудника — второй фактор входа в админку: с сайта его не отвязать и не сменить,

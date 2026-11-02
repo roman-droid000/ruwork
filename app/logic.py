@@ -45,6 +45,12 @@ RESP_MIN_SAMPLES = 3  # меньше ответов — время ответа 
 DAY_MS = 86_400_000
 EXT_MAX_DAYS = 7  # на сколько дней продавец может попросить продлить срок за один запрос
 VACATION_MAX_MS = 90 * DAY_MS
+FEE_FREE_MS = 30 * DAY_MS  # первый месяц после регистрации продавец работает без комиссии
+REF_PCT = 10  # доля комиссии с продаж приглашённого, которая уходит пригласившему
+REF_MS = 180 * DAY_MS  # сколько после регистрации приглашённого действует эта доля
+WELCOME_BONUS = 150  # приветственный бонус на заказы новым пользователям
+SHARE_VISITS = 5  # столько разных посетителей по ссылке «Поделиться» — и объявление получает день продвижения
+SHARE_COOLDOWN_MS = 30 * DAY_MS  # не чаще раза в 30 дней на объявление
 
 # (название, множитель цены, срок в днях, правок, что входит). Название тарифа сохраняется в заказе
 # (orders.tier_name), поэтому старые заказы показывают свой тариф и после смены этого списка.
@@ -177,9 +183,63 @@ def platform_add(conn: sqlite3.Connection, kind: str, coins: int, user_id=None, 
         )
 
 
-def sale_fee(amount: int) -> int:
+def sale_fee(amount: int, pct: int = SALE_FEE_PCT) -> int:
     """Комиссия платформы с продажи, округление вверх до монеты."""
-    return -(-amount * SALE_FEE_PCT // 100)
+    return -(-amount * pct // 100)
+
+
+def fee_pct(conn: sqlite3.Connection, seller_id) -> int:
+    """Комиссия продавца в процентах: 0 в первый месяц после регистрации, потом SALE_FEE_PCT."""
+    r = conn.execute("SELECT created_at FROM users WHERE id = ?", (seller_id,)).fetchone() if seller_id else None
+    return 0 if r and now_ms() - r["created_at"] < FEE_FREE_MS else SALE_FEE_PCT
+
+
+def take_fee(conn: sqlite3.Connection, seller_id, fee: int, order_id, note: str) -> None:
+    """Комиссия с продажи — на баланс платформы. REF_PCT % от неё получает тот, кто пригласил продавца,
+    пока с регистрации продавца не прошло REF_MS. Доля пригласившему — заработок, его можно вывести."""
+    if fee <= 0:
+        return
+    ref = 0
+    r = conn.execute("SELECT ref_by, created_at FROM users WHERE id = ?", (seller_id,)).fetchone() if seller_id else None
+    if r and r["ref_by"] and now_ms() - r["created_at"] < REF_MS:
+        ref = fee * REF_PCT // 100
+        if ref:
+            add_coins(conn, r["ref_by"], ref, ref)
+            add_op(conn, r["ref_by"], "refb", "bal", ref, "done", note)
+    platform_add(conn, "sale_fee", fee - ref, seller_id, order_id, note)
+
+
+def platform_bonus(conn: sqlite3.Connection, coins: int, user_id, order_id, note: str) -> None:
+    """Бонус, потраченный на заказ, оплачивает платформа: расход (минус) на её балансе; возврат бонуса — плюс."""
+    if coins:
+        conn.execute("INSERT INTO platform_ops(kind, coins, user_id, order_id, note, ts) VALUES ('bonus', ?, ?, ?, ?, ?)",
+                     (coins, user_id, order_id, note, now_ms()))
+
+
+def get_bonus(conn: sqlite3.Connection, user_id: str) -> int:
+    r = conn.execute("SELECT bonus FROM wallets WHERE user_id = ?", (user_id,)).fetchone()
+    return r["bonus"] if r else 0
+
+
+def add_bonus(conn: sqlite3.Connection, user_id: str, delta: int) -> None:
+    conn.execute("INSERT INTO wallets(user_id, coins, earned, bonus) VALUES (?, 0, 0, ?) ON CONFLICT(user_id)"
+                 " DO UPDATE SET bonus = bonus + excluded.bonus", (user_id, delta))
+
+
+def linked(conn: sqlite3.Connection, a: str, b) -> bool:
+    """Аккаунты входили с одного адреса — бонусом нельзя оплатить заказ у самого себя со второго аккаунта."""
+    return bool(b) and conn.execute(
+        "SELECT 1 FROM user_ips x JOIN user_ips y ON x.ip = y.ip WHERE x.user_id = ? AND y.user_id = ? LIMIT 1", (a, b)
+    ).fetchone() is not None
+
+
+def refund_order(conn: sqlite3.Connection, o: sqlite3.Row, refund: int) -> None:
+    """Возврат за заказ покупателю: сначала в бонус (не больше, чем им оплачено), остальное — как обычно."""
+    b = min(refund, o["paid_bonus"])
+    if b:
+        add_bonus(conn, o["user_id"], b)
+        platform_bonus(conn, b, o["user_id"], o["id"], f"{o['num']} · возврат бонуса")
+    refund_back(conn, o["user_id"], refund - b, o["paid_adv"])
 
 
 def complete_order(conn: sqlite3.Connection, o: sqlite3.Row, auto: bool = False, by_admin: bool = False) -> bool:
@@ -192,12 +252,13 @@ def complete_order(conn: sqlite3.Connection, o: sqlite3.Row, auto: bool = False,
         return False
     # Оплата через СБП в демо не проверяется, поэтому продавцу переводятся только монеты с баланса покупателя.
     paid = o["method"] == "bal" and o["seller_id"]
-    fee = sale_fee(o["amount"])
+    pct = fee_pct(conn, o["seller_id"])
+    fee = sale_fee(o["amount"], pct)
     net = o["amount"] - fee
     if paid:
         add_coins(conn, o["seller_id"], net, net)
         add_op(conn, o["seller_id"], "sale", "bal", net, "done", f"{o['num']} · {o['title']}", fee)
-        platform_add(conn, "sale_fee", fee, o["seller_id"], o["id"], f"{o['num']} · {o['title']}")
+        take_fee(conn, o["seller_id"], fee, o["id"], f"{o['num']} · {o['title']}")
     who = ("Спор решён в пользу продавца" if by_admin else
            "Получение подтверждено автоматически: прошло 7 дней" if auto else "Покупатель подтвердил получение")
     link = f"#/order/{o['id']}"
@@ -208,7 +269,8 @@ def complete_order(conn: sqlite3.Connection, o: sqlite3.Row, auto: bool = False,
     conn.execute(
         "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'order', ?, ?)",
         ("u:" + o["user_id"], o["gig_id"],
-         f"{who} по заказу {o['num']}." + (f" Продавцу переведено {rub(net)} (комиссия платформы {SALE_FEE_PCT} %: {rub(fee)})." if paid else ""), now_ms()),
+         f"{who} по заказу {o['num']}." + (f" Продавцу переведено {rub(net)} (" + (f"комиссия платформы {pct} %: {rub(fee)}" if pct else
+             "без комиссии: первый месяц продавца на RUWORK") + ")." if paid else ""), now_ms()),
     )
     return True
 
@@ -297,7 +359,9 @@ def user_state(conn: sqlite3.Connection, user_id: str) -> dict:
     ).fetchall()
     return {
         "orders": [order_row(o) for o in orders],
-        "wallet": {"coins": coins, "earned": earned, "adv": coins - earned, "ops": [dict(o) for o in ops]},
+        "wallet": {"coins": coins, "earned": earned, "adv": coins - earned, "bonus": get_bonus(conn, user_id),
+                   "ops": [dict(o) for o in ops]},
+        "perks": perks(conn, user_id),
         "inbox": {r[0]: r[1] for r in inbox},
         "sales": sales(conn, user_id),
         "favs": [r[0] for r in conn.execute("SELECT gig_id FROM favorites WHERE user_id = ? ORDER BY ts DESC", (user_id,))],
@@ -305,6 +369,19 @@ def user_state(conn: sqlite3.Connection, user_id: str) -> dict:
         "searches": [dict(r) for r in conn.execute(
             "SELECT id, q, cat, sub, max, ts FROM saved_searches WHERE user_id = ? ORDER BY ts DESC", (user_id,))],
     }
+
+
+def perks(conn: sqlite3.Connection, user_id: str) -> dict:
+    """Условия для продавца: до какого времени комиссия 0 %, приглашённые и доход с них, проверка опыта."""
+    u = conn.execute("SELECT created_at, ext_url, ext_site, ext_rating, ext_reviews, ext_status, ext_note"
+                     " FROM users WHERE id = ?", (user_id,)).fetchone()
+    invited = conn.execute("SELECT count(*) FROM users WHERE ref_by = ? AND deleted_at IS NULL", (user_id,)).fetchone()[0]
+    earned = conn.execute("SELECT coalesce(sum(coins), 0) FROM wallet_ops WHERE user_id = ? AND t = 'refb'",
+                          (user_id,)).fetchone()[0]
+    free_until = u["created_at"] + FEE_FREE_MS
+    return {"fee_free_until": free_until if free_until > now_ms() else None, "fee_pct": SALE_FEE_PCT,
+            "ref": {"invited": invited, "earned": earned, "pct": REF_PCT},
+            "ext": {k: u["ext_" + k] for k in ("url", "site", "rating", "reviews", "status", "note")}}
 
 
 def unread_notes(conn: sqlite3.Connection, user_id: str) -> int:
@@ -471,15 +548,15 @@ def resolve_dispute(conn: sqlite3.Connection, o: sqlite3.Row, act: str) -> None:
     bal = o["method"] == "bal"
     refund = o["amount"] if act == "buyer" else o["amount"] // 2
     part = o["amount"] - refund
-    fee = sale_fee(part) if part else 0
+    fee = sale_fee(part, fee_pct(conn, o["seller_id"])) if part else 0
     note = f"{o['num']} · {o['title']}"
     if bal:
-        refund_back(conn, o["user_id"], refund, o["paid_adv"])
+        refund_order(conn, o, refund)
         add_op(conn, o["user_id"], "ref", "bal", refund, "done", note)
         if part and o["seller_id"]:
             add_coins(conn, o["seller_id"], part - fee, part - fee)
             add_op(conn, o["seller_id"], "sale", "bal", part - fee, "done", note, fee)
-            platform_add(conn, "sale_fee", fee, o["seller_id"], o["id"], note)
+            take_fee(conn, o["seller_id"], fee, o["id"], note)
     if act == "buyer":
         text = f"Спор по заказу {o['num']} решён в пользу покупателя." + (f" Покупателю возвращено {rub(refund)}." if bal else "")
         nb, ns = (f"Спор по заказу {o['num']} решён в вашу пользу." + (f" Возвращено {rub(refund)}." if bal else ""),

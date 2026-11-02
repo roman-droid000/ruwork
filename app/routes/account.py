@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from .. import auth, guard, tg
 from ..db import get_db, now_ms, tx
-from ..logic import esc, new_id, unread_notes, user_state
+from ..logic import WELCOME_BONUS, add_bonus, add_op, esc, new_id, notify, unread_notes, user_state
 
 router = APIRouter(prefix="/api")
 
@@ -37,6 +37,7 @@ class RegisterIn(BaseModel):
     password: str
     password2: str
     terms: bool
+    ref: str = ""  # id пригласившего из реферальной ссылки ?ref=…
 
 
 class LoginIn(BaseModel):
@@ -114,6 +115,18 @@ def check_reg_code(conn: sqlite3.Connection, request: Request, code: str) -> sql
     return r
 
 
+def welcome(conn: sqlite3.Connection, user_id: str, name: str, ref: str) -> None:
+    """Новому аккаунту — приветственный бонус на заказы; пригласившему — уведомление и связь для реферальной доли."""
+    add_bonus(conn, user_id, WELCOME_BONUS)
+    add_op(conn, user_id, "bonus", "bal", WELCOME_BONUS, "done", "Приветственный бонус на заказы")
+    inviter = conn.execute("SELECT id FROM users WHERE id = ? AND blocked_at IS NULL AND deleted_at IS NULL",
+                           (ref,)).fetchone() if ref else None
+    if inviter:
+        conn.execute("UPDATE users SET ref_by = ? WHERE id = ?", (inviter["id"], user_id))
+        notify(conn, inviter["id"], "ref", f"По вашей ссылке зарегистрировался {html.unescape(name)}. Полгода вы будете"
+               " получать долю комиссии с его продаж.", "#/dashboard/profile")
+
+
 @router.post("/auth/register")
 def register(body: RegisterIn, request: Request, response: Response, conn: sqlite3.Connection = Depends(get_db)):
     if guard.limited("reg-ip:" + guard.client_ip(request), REGISTER_PER_IP):
@@ -160,6 +173,7 @@ def register(body: RegisterIn, request: Request, response: Response, conn: sqlit
         )
         if via_tg:
             conn.execute("DELETE FROM tg_regs WHERE chat_id = ?", (chat,))
+        welcome(conn, user_id, name, body.ref.strip()[:40])
         auth.start_session(conn, response, user_id)
         auth.remember_ip(conn, user_id, guard.client_ip(request))
     if via_tg:

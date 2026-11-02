@@ -213,6 +213,12 @@ CREATE TABLE IF NOT EXISTS reports (
     UNIQUE (user_id, kind, target)
 );
 CREATE INDEX IF NOT EXISTS reports_status ON reports(status, ts);
+CREATE TABLE IF NOT EXISTS share_visits (
+    gig_id TEXT NOT NULL,
+    ip     TEXT NOT NULL,
+    ts     INTEGER NOT NULL,
+    PRIMARY KEY (gig_id, ip)
+);
 CREATE TABLE IF NOT EXISTS ideas (
     id        TEXT PRIMARY KEY,
     user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -476,6 +482,27 @@ def init_db() -> None:
             conn.execute("ALTER TABLE users ADD COLUMN del_code TEXT")
             conn.execute("ALTER TABLE users ADD COLUMN del_code_ts INTEGER")
             conn.execute("ALTER TABLE users ADD COLUMN del_tries INTEGER NOT NULL DEFAULT 0")
+        # Миграция: рост площадки. Приветственный бонус (отдельно от монет: тратится только на заказы, не выводится
+        # и не возвращается на карту), реферальная ссылка, проверенный опыт на других площадках,
+        # бесплатный день продвижения за переходы по ссылке «Поделиться».
+        if "bonus" not in {r[1] for r in conn.execute("PRAGMA table_info(wallets)")}:
+            conn.execute("ALTER TABLE wallets ADD COLUMN bonus INTEGER NOT NULL DEFAULT 0")
+        if "paid_bonus" not in {r[1] for r in conn.execute("PRAGMA table_info(orders)")}:
+            conn.execute("ALTER TABLE orders ADD COLUMN paid_bonus INTEGER NOT NULL DEFAULT 0")
+        ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+        if "ref_by" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN ref_by TEXT")
+        if "ext_status" not in ucols:
+            conn.execute("ALTER TABLE users ADD COLUMN ext_url TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE users ADD COLUMN ext_site TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE users ADD COLUMN ext_rating REAL")
+            conn.execute("ALTER TABLE users ADD COLUMN ext_reviews INTEGER")
+            conn.execute("ALTER TABLE users ADD COLUMN ext_status TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE users ADD COLUMN ext_note TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE users ADD COLUMN ext_at INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS users_ref ON users(ref_by)")
+        if "share_reward_at" not in {r[1] for r in conn.execute("PRAGMA table_info(gigs)")}:
+            conn.execute("ALTER TABLE gigs ADD COLUMN share_reward_at INTEGER")
         for sub in ("covers", "results", "avatars", "reviews", "portfolio"):
             (UPLOAD_DIR / sub).mkdir(parents=True, exist_ok=True)
         with tx(conn):

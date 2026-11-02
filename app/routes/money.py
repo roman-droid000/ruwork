@@ -11,7 +11,8 @@ from .. import auth, guard
 from ..db import get_db, now_ms, tx
 from ..logic import (
     BANKS, MAX_DEP, MIN_DEP, MIN_WD, PLATFORM_CANCEL_PCT, REFUND_WORK_PCT, SBP_ORDERS, ST_CANCEL, ST_WAIT, ST_WORK, TIERS,
-    add_coins, add_op, fee_of, get_coins, get_wallet, mk_tiers, new_id, nf, notify, platform_add, refund_back, rub, spend,
+    add_bonus, add_coins, add_op, fee_of, get_bonus, get_coins, get_wallet, linked, mk_tiers, new_id, nf, notify, platform_add,
+    platform_bonus, refund_order, rub, spend,
     user_state, VISIBLE_SQL,
 )
 
@@ -47,22 +48,34 @@ def int_amount(x: float) -> int | None:
     return int(x) if float(x).is_integer() else None
 
 
+def usable_bonus(conn: sqlite3.Connection, user_id: str, seller_ids) -> int:
+    """Сколько бонуса можно потратить на заказ у этих продавцов: 0, если хоть один из них — связанный аккаунт."""
+    b = get_bonus(conn, user_id)
+    return 0 if not b or any(linked(conn, user_id, s) for s in seller_ids) else b
+
+
 def place_order(conn: sqlite3.Connection, user_id: str, g: sqlite3.Row, tier: int, tier_name: str, price: int,
                 days: int, revs: int, method: str, k: int = 0) -> str:
-    """Создаёт один заказ: списывает оплату с баланса, пишет сообщение в диалог и уведомляет продавца.
-    Номер — по числу заказов покупателя, k — сдвиг для нескольких заказов из одной корзины."""
-    paid_adv = 0
+    """Создаёт один заказ: списывает оплату (сначала приветственный бонус, потом монеты), пишет сообщение в диалог
+    и уведомляет продавца. Номер — по числу заказов покупателя, k — сдвиг для нескольких заказов из одной корзины."""
+    paid_adv = paid_bonus = 0
     if method == "bal":
-        paid_adv = spend(conn, user_id, price)
-        add_op(conn, user_id, "pay", "bal", price, "done", g["title"])
+        paid_bonus = min(price, usable_bonus(conn, user_id, [g["owner_id"]]))
+        if paid_bonus:
+            add_bonus(conn, user_id, -paid_bonus)
+        paid_adv = spend(conn, user_id, price - paid_bonus)
+        add_op(conn, user_id, "pay", "bal", price, "done", g["title"] + (f" · бонусом {paid_bonus}" if paid_bonus else ""))
     count = conn.execute("SELECT count(*) FROM orders WHERE user_id = ?", (user_id,)).fetchone()[0]
     num, oid, ts = f"#RW-{1040 + count}", new_id(), now_ms() + k
     conn.execute(
         "INSERT INTO orders(id, user_id, num, gig_id, title, tier, tier_name, status, amount, method, created_at,"
-        " started_at, seller_id, seller_seen, paid_adv, days, revs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " started_at, seller_id, seller_seen, paid_adv, days, revs, paid_bonus)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (oid, user_id, num, g["id"], g["title"], tier, tier_name,
-         ST_WAIT, price, method, ts, None, g["owner_id"], 0 if g["owner_id"] else 1, paid_adv, days, revs),
+         ST_WAIT, price, method, ts, None, g["owner_id"], 0 if g["owner_id"] else 1, paid_adv, days, revs, paid_bonus),
     )
+    if paid_bonus:
+        platform_bonus(conn, -paid_bonus, user_id, oid, f"{num} · {g['title']}")
     # Заказ открывает диалог покупателя с продавцом: продавец видит его в «Сообщениях покупателей».
     conn.execute(
         "INSERT INTO chat_messages(owner, gig_id, role, text, ts) VALUES (?, ?, 'order', ?, ?)",
@@ -105,7 +118,7 @@ def create_order(body: OrderIn, user=Depends(auth.require_user), conn: sqlite3.C
             items.append((g, it.tier, mk_tiers(g["base"])[it.tier]["rub"]))
         total = sum(price for _, _, price in items)
         if body.method == "bal":
-            if get_coins(conn, user["id"]) < total:
+            if get_coins(conn, user["id"]) + usable_bonus(conn, user["id"], [g["owner_id"] for g, _, _ in items]) < total:
                 raise HTTPException(400, "Недостаточно монет на балансе")
         placed = [place_order(conn, user["id"], g, tier, TIERS[tier][0], price, TIERS[tier][2], TIERS[tier][3], body.method, k)
                   for k, (g, tier, price) in enumerate(items)]
@@ -132,7 +145,7 @@ def cancel_order(order_id: str, user=Depends(auth.require_user), conn: sqlite3.C
         refund = 0
         if o["method"] == "bal":
             refund = o["amount"] if o["status"] == ST_WAIT else o["amount"] * REFUND_WORK_PCT // 100
-            refund_back(conn, user["id"], refund, o["paid_adv"])
+            refund_order(conn, o, refund)
             add_op(conn, user["id"], "ref", "bal", refund, "done", o["title"])
             kept = o["amount"] - refund
             fee = kept if not o["seller_id"] else min(kept, o["amount"] * PLATFORM_CANCEL_PCT // 100)

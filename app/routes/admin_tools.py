@@ -40,7 +40,7 @@ def log(user: str = "", limit: int = 300, conn: sqlite3.Connection = Depends(get
 # заявки и возвращаются при отказе, поэтому учитываются в статусах «ожидает» и «выполнено».
 LEDGER_SQL = """
 SELECT user_id, sum(CASE
-    WHEN t IN ('dep', 'ref', 'sale', 'comp', 'adj_in') AND status = 'done' THEN coins
+    WHEN t IN ('dep', 'ref', 'sale', 'comp', 'adj_in', 'bonus', 'refb') AND status = 'done' THEN coins
     WHEN t IN ('pay', 'promo', 'adj_out') AND status = 'done' THEN -coins
     WHEN t IN ('wd', 'rf') AND status IN ('pending', 'done') THEN -coins
     ELSE 0 END) AS expected
@@ -50,7 +50,7 @@ FROM wallet_ops GROUP BY user_id
 
 def reconcile_rows(conn: sqlite3.Connection) -> list[dict]:
     exp = {r["user_id"]: r["expected"] for r in conn.execute(LEDGER_SQL)}
-    have = {r["user_id"]: r["coins"] for r in conn.execute("SELECT user_id, coins FROM wallets")}
+    have = {r["user_id"]: r["coins"] + r["bonus"] for r in conn.execute("SELECT user_id, coins, bonus FROM wallets")}
     out = []
     for uid in set(exp) | set(have):
         e, h = exp.get(uid, 0), have.get(uid, 0)

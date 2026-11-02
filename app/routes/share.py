@@ -12,6 +12,7 @@ import hashlib
 import html
 import io
 import json
+import re
 import sqlite3
 from functools import lru_cache
 from pathlib import Path
@@ -124,20 +125,28 @@ def share_page(request: Request, title: str, desc: str, image: str, target: str)
     return HTMLResponse(page, headers={"Cache-Control": "public, max-age=300"})
 
 
+REF_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def with_ref(ref: str, hash_path: str) -> str:
+    """?ref=<id> того, кто поделился: реферальная ссылка и счётчик переходов для бесплатного продвижения."""
+    return (f"/?ref={ref}" if REF_RE.match(ref) else "/") + hash_path
+
+
 @router.get("/g/{gig_id}", include_in_schema=False)
-def share_gig(gig_id: str, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+def share_gig(gig_id: str, request: Request, ref: str = "", conn: sqlite3.Connection = Depends(get_db)):
     g = load_gig(conn, gig_id)
     title, desc = gig_lines(g)
     v = version(title, desc, g["cover"])
-    return share_page(request, title, desc, f"/og/gig/{g['id']}.jpg?v={v}", f"/#/gig/{g['id']}")
+    return share_page(request, title, desc, f"/og/gig/{g['id']}.jpg?v={v}", with_ref(ref, f"#/gig/{g['id']}"))
 
 
 @router.get("/s/{user_id}", include_in_schema=False)
-def share_seller(user_id: str, request: Request, conn: sqlite3.Connection = Depends(get_db)):
+def share_seller(user_id: str, request: Request, ref: str = "", conn: sqlite3.Connection = Depends(get_db)):
     s = load_seller(conn, user_id)
     title, desc = seller_lines(s)
     v = version(title, desc, s["avatar"])
-    return share_page(request, title, desc, f"/og/seller/{s['id']}.jpg?v={v}", f"/#/seller/{s['id']}")
+    return share_page(request, title, desc, f"/og/seller/{s['id']}.jpg?v={v}", with_ref(ref, f"#/seller/{s['id']}"))
 
 
 @lru_cache(maxsize=32)

@@ -20,7 +20,7 @@ from ..logic import (
     seller_level, user_state,
 )
 from .chat import chat_owner
-from .money import place_order, seller_away
+from .money import place_order, seller_away, usable_bonus
 from .orders import COVER_MAX, NAME_RE, cover_ext
 
 router = APIRouter()
@@ -208,7 +208,7 @@ def accept_offer(offer_id: str, user=Depends(auth.require_user), conn: sqlite3.C
             raise HTTPException(400, "Объявление продавца больше недоступно")
         if seller_away(conn, g["owner_id"]):
             raise HTTPException(400, "Продавец сейчас в отпуске и не принимает заказы")
-        if get_coins(conn, user["id"]) < of["price"]:
+        if get_coins(conn, user["id"]) + usable_bonus(conn, user["id"], [g["owner_id"]]) < of["price"]:
             raise HTTPException(400, f"Недостаточно монет: нужно {rub(of['price'])}. Пополните баланс в кошельке.")
         oid = place_order(conn, user["id"], g, 0, "Заказ с биржи", of["price"], of["days"], TIERS[0][3], "bal")
         conn.execute("UPDATE requests SET status = ?, order_id = ? WHERE id = ?", (REQ_HIRED, oid, r["id"]))

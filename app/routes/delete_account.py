@@ -111,6 +111,11 @@ def delete_account(body: DeleteIn, request: Request, response: Response, user=De
             add_op(conn, uid, "adj_out", "adm", coins, "done", "Остаток при удалении аккаунта")
             platform_add(conn, "forfeit", coins, uid, None, "Остаток при удалении аккаунта")
             conn.execute("UPDATE wallets SET coins = 0, earned = 0 WHERE user_id = ?", (uid,))
+        # Неизрасходованный приветственный бонус просто сгорает: платформа его не тратила.
+        bonus = conn.execute("SELECT bonus FROM wallets WHERE user_id = ?", (uid,)).fetchone()
+        if bonus and bonus[0] > 0:
+            add_op(conn, uid, "adj_out", "adm", bonus[0], "done", "Бонус при удалении аккаунта")
+            conn.execute("UPDATE wallets SET bonus = 0 WHERE user_id = ?", (uid,))
         covers = [r[0] for r in conn.execute("SELECT cover FROM gigs WHERE owner_id = ?", (uid,))]
         works = [r[0] for r in conn.execute("SELECT name FROM portfolio WHERE user_id = ?", (uid,))]
         conn.execute("DELETE FROM chat_messages WHERE gig_id IN (SELECT id FROM gigs WHERE owner_id = ?)", (uid,))

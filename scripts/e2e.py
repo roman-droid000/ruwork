@@ -182,7 +182,11 @@ def run(base: str, db: Path, tmp: Path) -> None:
     check("баланс пополнен", buyer.ok("GET", "/api/state")["wallet"]["coins"] == price * 4)
 
     step("6. Заказ → результат → доработка → подтверждение")
+    check("новому покупателю начислен бонус", buyer.ok("GET", "/api/state")["wallet"]["bonus"] == meta["welcome_bonus"])
     buyer.ok("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
+    wb = buyer.ok("GET", "/api/state")["wallet"]
+    check("бонус списан первым, остальное — монетами",
+          wb["bonus"] == 0 and wb["coins"] == price * 4 - (price - meta["welcome_bonus"]), wb)
     oid = buyer.ok("GET", "/api/state")["orders"][0][5]
     sql("UPDATE orders SET created_at = created_at - 61000 WHERE id = ?", oid)
     check("заказ перешёл «В работе»", buyer.ok("GET", f"/api/orders/{oid}")["status"] == "В работе")
@@ -200,8 +204,9 @@ def run(base: str, db: Path, tmp: Path) -> None:
     buyer.ok("POST", f"/api/orders/{oid}/confirm")
     check("заказ выполнен", buyer.ok("GET", f"/api/orders/{oid}")["status"] == "Выполнен")
     w = seller.ok("GET", "/api/state")["wallet"]
-    net = price - -(-price * meta["sale_fee_pct"] // 100)
-    check(f"продавцу зачислено {net} (минус комиссия)", w["earned"] == net, w)
+    net = price
+    check(f"продавцу зачислено {net}: первый месяц без комиссии", w["earned"] == net, w)
+    check("в профиле видно, до какого времени комиссия 0 %", bool(seller.ok("GET", "/api/state")["perks"]["fee_free_until"]))
     buyer.ok("POST", f"/api/orders/{oid}/review", {"stars": 5, "text": "Всё отлично, спасибо!"})
     check("отзыв опубликован", len(buyer.ok("GET", f"/api/gigs/{gig['id']}/reviews")) == 1)
 
@@ -263,6 +268,72 @@ def run(base: str, db: Path, tmp: Path) -> None:
           any("взяли её в работу" in n["text"] for n in buyer.ok("GET", "/api/notifications")["items"]))
     code, _ = admin.call("POST", f"/api/admin/ideas/{ideas[0]['id']}/status", {"status": "bogus"})
     check("неизвестный статус отклоняется", code == 400)
+
+    step("10б. Привлечение: рефералы, комиссия после первого месяца, опыт с площадок, «Поделиться», SEO")
+    inviter = Client(base, "10.0.2.1")
+    inviter.ok("POST", "/api/auth/register", {"name": "Пригласивший" + sfx, "email": f"i{sfx}@e2e.test", "password": pw,
+                                              "password2": pw, "terms": True})
+    inv_id = inviter.ok("GET", "/api/state")["me"]["id"]
+    friend = Client(base, "10.0.2.2")
+    friend.ok("POST", "/api/auth/register", {"name": "Друг" + sfx, "email": f"f{sfx}@e2e.test", "password": pw,
+                                             "password2": pw, "terms": True, "ref": inv_id})
+    check("приглашённый засчитан", inviter.ok("GET", "/api/state")["perks"]["ref"]["invited"] == 1)
+    same_ip = Client(base, "10.0.0.1")  # тот же адрес, что у продавца
+    same_ip.ok("POST", "/api/auth/register", {"name": "Близнец" + sfx, "email": f"z{sfx}@e2e.test", "password": pw,
+                                              "password2": pw, "terms": True})
+    code, _ = same_ip.call("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
+    check("бонусом нельзя оплатить заказ у связанного аккаунта", code == 400)
+    # Продавцу больше месяца, его пригласил inviter: комиссия 5 %, из неё 10 % — пригласившему.
+    sql("UPDATE users SET created_at = created_at - 31 * 86400000, ref_by = ? WHERE id = ?", inv_id, me_s["id"])
+    earned0 = seller.ok("GET", "/api/state")["wallet"]["earned"]
+    buyer.ok("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
+    oid3 = buyer.ok("GET", "/api/state")["orders"][0][5]
+    sql("UPDATE orders SET created_at = created_at - 61000 WHERE id = ?", oid3)
+    buyer.ok("GET", "/api/state")
+    f3 = seller.ok("POST", f"/api/orders/{oid3}/files", {"name": "r.txt", "size": 3, "mime": "text/plain"})
+    seller.ok("PUT", f"/api/orders/{oid3}/files/{f3['id']}?offset=0", raw=b"r v", ctype="application/octet-stream")
+    buyer.ok("POST", f"/api/orders/{oid3}/confirm")
+    fee = -(-price * meta["sale_fee_pct"] // 100)
+    check(f"после первого месяца комиссия {meta['sale_fee_pct']} %",
+          seller.ok("GET", "/api/state")["wallet"]["earned"] == earned0 + price - fee)
+    ri = inviter.ok("GET", "/api/state")
+    sql("UPDATE users SET created_at = created_at + 31 * 86400000 WHERE id = ?", me_s["id"])  # дальше продавец снова новый
+    check("пригласивший получил долю комиссии", ri["wallet"]["earned"] == fee * 10 // 100 and ri["perks"]["ref"]["earned"] == fee * 10 // 100, ri["wallet"])
+
+    code, _ = seller.call("POST", "/api/me/ext", {"url": "https://example.com/me", "rating": 4.9, "reviews": 10})
+    check("ссылка не с площадки фриланса отклоняется", code == 400)
+    seller.ok("POST", "/api/me/ext", {"url": "https://kwork.ru/user/e2e", "rating": 4.9, "reviews": 120})
+    exts = admin.ok("GET", "/api/admin/ext")
+    check("заявка видна администратору", any(x["user_id"] == me_s["id"] and x["ext_status"] == "pending" for x in exts), exts)
+    code, _ = buyer.call("GET", "/api/admin/ext")
+    check("обычный пользователь не видит заявки", code in (401, 403))
+    admin.ok("POST", f"/api/admin/ext/{me_s['id']}/approve", {})
+    sp = buyer.ok("GET", f"/api/sellers/{me_s['id']}")
+    check("опыт с Kwork и значок в профиле продавца", sp["ext"] and sp["ext"]["site"] == "Kwork" and sp["verified"], sp.get("ext"))
+
+    seller.ok("POST", "/api/share/visit", {"gig": gig["id"], "ref": me_s["id"]})
+    for i in range(5):
+        Client(base, f"10.0.3.{i + 1}").ok("POST", "/api/share/visit", {"gig": gig["id"], "ref": me_s["id"]})
+        if i == 3:
+            check("4 перехода — продвижения ещё нет", seller.ok("GET", "/api/me/share")[gig["id"]]["n"] == 4)
+    g_after = next(g for g in buyer.ok("GET", "/api/gigs") if g["id"] == gig["id"])
+    check("5 переходов по ссылке — бесплатные сутки продвижения", g_after["promo"] is True)
+    check("следующее бесплатное продвижение — через 30 дней", bool(seller.ok("GET", "/api/me/share")[gig["id"]]["next"]))
+    code, page = buyer.call("GET", f"/g/{gig['id']}?ref={me_s['id']}")
+    check("ссылка «Поделиться» передаёт ref", code == 200 and f"/?ref={me_s['id']}#/gig/{gig['id']}" in page)
+
+    code, page = buyer.call("GET", "/uslugi")
+    check("SEO: страница всех услуг", code == 200 and "Коучинг и наставничество" in page)
+    code, page = buyer.call("GET", f"/uslugi/{gig['cat']}")
+    check("SEO: страница категории с объявлением", code == 200 and gig["id"] in page, code)
+    code, page = buyer.call("GET", "/uslugi/coach/nastavnichestvo-mentorstvo")
+    check("SEO: страница подкатегории", code == 200 and "<h1>Наставничество-менторство на заказ</h1>" in page, code)
+    code, _ = buyer.call("GET", "/uslugi/nope")
+    check("SEO: несуществующая категория — 404", code == 404)
+    code, sm = buyer.call("GET", "/sitemap.xml")
+    check("sitemap.xml со страницами услуг", code == 200 and "/uslugi/coach/layf-kouching" in sm)
+    code, rb = buyer.call("GET", "/robots.txt")
+    check("robots.txt ссылается на sitemap", code == 200 and "Sitemap:" in rb)
 
     step("11. Защита входа")
     attacker = Client(base, "10.0.0.99")
