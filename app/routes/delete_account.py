@@ -105,7 +105,7 @@ def delete_account(body: DeleteIn, request: Request, response: Response, user=De
             raise HTTPException(400, "Сейчас удалить аккаунт нельзя: " + "; ".join(problems) + ".")
         coins, _ = get_wallet(conn, uid)
         if coins > 0 and not body.forfeit:
-            raise HTTPException(400, f"На балансе {nf(coins)} мон. Выведите заработок или верните аванс на карту — "
+            raise HTTPException(400, f"На балансе {nf(coins)} мон. Выведите заработок — "
                                      "или подтвердите, что остаток сгорит.")
         if coins > 0:
             add_op(conn, uid, "adj_out", "adm", coins, "done", "Остаток при удалении аккаунта")

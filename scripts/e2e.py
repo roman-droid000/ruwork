@@ -180,17 +180,26 @@ def run(base: str, db: Path, tmp: Path) -> None:
     seller.ok("POST", f"/api/chat/{gig['id']}/reply", {"to": me_b["id"], "text": "Добрый день, всё обсудим здесь."})
 
     step("5. Пополнение баланса покупателя")
-    buyer.ok("POST", "/api/wallet/deposit", {"amount": price * 4})
+    code, _ = buyer.call("POST", "/api/wallet/deposit", {"amount": 10001})
+    check("пополнение больше 10 000 отклоняется", code == 400)
+    code, _ = buyer.call("POST", "/api/wallet/deposit", {"amount": 1500})
+    check("пополнение только на суммы из списка: 1 500 — нельзя", code == 400 and 1500 not in meta["dep_amounts"], meta.get("dep_amounts"))
+    dep_sum = 5000  # есть в списке сумм пополнения; хватает на все заказы теста
+    buyer.ok("POST", "/api/wallet/deposit", {"amount": dep_sum})
     dep = next(o for o in admin.ok("GET", "/api/admin/ops") if o["status"] == "pending" and o["t"] == "dep")
     admin.ok("POST", f"/api/admin/ops/{dep['id']}/approve")
-    check("баланс пополнен", buyer.ok("GET", "/api/state")["wallet"]["coins"] == price * 4)
+    check("баланс пополнен", buyer.ok("GET", "/api/state")["wallet"]["coins"] == dep_sum)
+    code, err = buyer.call("POST", "/api/wallet/refund", {"amount": 100})
+    check("возврат на карту отключён — монеты остаются на балансе", code == 400 and "не производится" in str(err), err)
 
     step("6. Заказ → результат → доработка → подтверждение")
+    code, err = buyer.call("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "sbp"})
+    check("оплата заказа через СБП отключена — только с баланса", code == 400 and "с баланса" in str(err), err)
     check("пришедшему по ссылке-приглашению начислен бонус", buyer.ok("GET", "/api/state")["wallet"]["bonus"] == meta["welcome_bonus"])
     buyer.ok("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
     wb = buyer.ok("GET", "/api/state")["wallet"]
     check("бонус списан первым, остальное — монетами",
-          wb["bonus"] == 0 and wb["coins"] == price * 4 - (price - meta["welcome_bonus"]), wb)
+          wb["bonus"] == 0 and wb["coins"] == dep_sum - (price - meta["welcome_bonus"]), wb)
     oid = buyer.ok("GET", "/api/state")["orders"][0][5]
     sql("UPDATE orders SET created_at = created_at - 61000 WHERE id = ?", oid)
     check("заказ перешёл «В работе»", buyer.ok("GET", f"/api/orders/{oid}")["status"] == "В работе")

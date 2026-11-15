@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from .. import auth, guard
 from ..db import get_db, now_ms, tx
 from ..logic import (
-    BANKS, MAX_DEP, MIN_DEP, MIN_WD, PLATFORM_CANCEL_PCT, REFUND_WORK_PCT, SBP_ORDERS, ST_CANCEL, ST_WAIT, ST_WORK, TIERS,
+    BANKS, DEP_AMOUNTS, DEP_AMOUNTS_TEXT, MIN_WD, PLATFORM_CANCEL_PCT, REFUND_WORK_PCT, ST_CANCEL, ST_WAIT, ST_WORK, TIERS,
     add_bonus, add_coins, add_op, fee_of, get_bonus, get_coins, get_wallet, linked, mk_tiers, new_id, nf, notify, platform_add,
     platform_bonus, refund_order, rub, spend,
     user_state, VISIBLE_SQL,
@@ -97,10 +97,11 @@ def seller_away(conn: sqlite3.Connection, owner_id) -> int | None:
 
 @router.post("/orders")
 def create_order(body: OrderIn, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
-    if body.method not in ("sbp", "bal") or not body.items:
+    if not body.items:
         raise HTTPException(400, "Корзина пуста")
-    if body.method == "sbp" and not SBP_ORDERS:
-        raise HTTPException(400, "Оплата через СБП временно недоступна. Оплатите заказ с баланса.")
+    # Заказы оплачиваются только монетами с баланса; через СБП баланс пополняется (/api/wallet/deposit).
+    if body.method != "bal":
+        raise HTTPException(400, "Заказ оплачивается монетами с баланса. Пополните баланс через СБП в кошельке.")
     with tx(conn):
         items = []
         for it in body.items:
@@ -166,8 +167,8 @@ def sales_seen(user=Depends(auth.require_user), conn: sqlite3.Connection = Depen
 @router.post("/wallet/deposit")
 def deposit(body: DepositIn, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
     a = int_amount(body.amount)
-    if a is None or not MIN_DEP <= a <= MAX_DEP:
-        raise HTTPException(400, f"Введите целое число от {nf(MIN_DEP)} до {nf(MAX_DEP)}")
+    if a not in DEP_AMOUNTS:
+        raise HTTPException(400, f"Выберите сумму пополнения: {DEP_AMOUNTS_TEXT} монет")
     with tx(conn):
         add_op(conn, user["id"], "dep", "sbp", a, "pending")
         guard.alert(f"Заявка на пополнение: {user['name']} — {nf(a)} мон.", "#/admin/ops")
@@ -175,41 +176,12 @@ def deposit(body: DepositIn, user=Depends(auth.require_user), conn: sqlite3.Conn
 
 
 @router.post("/wallet/refund")
-def refund_to_card(body: RefundIn, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
-    """Возврат неизрасходованного аванса тем же платежом, которым пополняли: на другую карту аванс не выводится.
-    Сумма раскладывается по пополнениям, начиная с последних, — по одной заявке на каждый исходный платёж
-    (шлюз возвращает деньги в пределах суммы платежа)."""
-    a = int_amount(body.amount)
-    if a is None or a < 1:
-        raise HTTPException(400, "Введите целое число монет")
-    with tx(conn):
-        coins, earned = get_wallet(conn, user["id"])
-        if a > coins - earned:
-            raise HTTPException(400, f"Вернуть на карту можно не больше {nf(max(0, coins - earned))} монет")
-        deps = conn.execute(
-            "SELECT d.id, d.ts, d.coins - coalesce((SELECT sum(r.coins) FROM wallet_ops r WHERE r.src = d.id"
-            " AND r.t = 'rf' AND r.status != 'cancelled'), 0) AS free FROM wallet_ops d"
-            " WHERE d.user_id = ? AND d.t = 'dep' AND d.status = 'done' ORDER BY d.ts DESC, d.rowid DESC",
-            (user["id"],),
-        ).fetchall()
-        left = a
-        for d in deps:
-            part = min(left, d["free"])
-            if part <= 0:
-                continue
-            day = time.strftime("%d.%m.%Y", time.localtime(d["ts"] / 1000))
-            conn.execute(
-                "INSERT INTO wallet_ops(id, user_id, t, method, coins, fee, status, dest, ts, src)"
-                " VALUES (?, ?, 'rf', 'sbp', ?, 0, 'pending', ?, ?, ?)",
-                (new_id(), user["id"], part, f"На платёж пополнения от {day}", now_ms(), d["id"]),
-            )
-            left -= part
-            if not left:
-                break
-        if left:
-            raise HTTPException(400, "Не найдено пополнений, на которые можно сделать возврат. Напишите в поддержку.")
-        add_coins(conn, user["id"], -a)
-        return user_state(conn, user["id"])
+def refund_to_card(body: RefundIn, user=Depends(auth.require_user)):
+    """Возврат пополнений на карту не производится: пополненные монеты остаются на балансе и тратятся на заказы
+    и продвижение, возвраты по заказам тоже приходят на баланс. Заявки «Возврат на карту», созданные раньше,
+    администратор по-прежнему одобряет или отклоняет во вкладке «Деньги»."""
+    raise HTTPException(400, "Возврат на карту не производится: пополненные монеты остаются на балансе и тратятся "
+                             "на заказы и продвижение.")
 
 
 @router.post("/wallet/withdraw")
@@ -230,7 +202,7 @@ def withdraw(body: WithdrawIn, user=Depends(auth.require_user), conn: sqlite3.Co
         earned = get_wallet(conn, user["id"])[1]
         if a > earned:
             raise HTTPException(400, f"Вывести можно только заработок с продаж: доступно {nf(earned)} монет."
-                                     " Пополнения возвращаются на карту, с которой оплачены.")
+                                     " Пополненные монеты на карту не возвращаются — их можно потратить на заказы.")
         add_coins(conn, user["id"], -a, -a)
         op_id = add_op(conn, user["id"], "wd", "sbp", a, "pending", f"+7 ••• •• {phone[-4:]} · {body.bank}", fee_of(a))
         conn.execute("UPDATE wallet_ops SET phone = ? WHERE id = ?", (phone, op_id))
