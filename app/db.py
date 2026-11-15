@@ -462,6 +462,10 @@ def init_db() -> None:
         # Миграция: полный телефон вывода (для администратора и проверки совпадений между аккаунтами).
         if "phone" not in {r[1] for r in conn.execute("PRAGMA table_info(wallet_ops)")}:
             conn.execute("ALTER TABLE wallet_ops ADD COLUMN phone TEXT")
+        # Миграция: номер счёта в платёжном шлюзе (Robokassa InvId) у пополнения через шлюз.
+        if "inv_id" not in {r[1] for r in conn.execute("PRAGMA table_info(wallet_ops)")}:
+            conn.execute("ALTER TABLE wallet_ops ADD COLUMN inv_id INTEGER")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS wallet_ops_inv ON wallet_ops(inv_id) WHERE inv_id IS NOT NULL")
         # Миграция: модерация объявлений — ok (в каталоге), pending (ждёт проверки), hidden (скрыто с причиной).
         if "mod" not in {r[1] for r in conn.execute("PRAGMA table_info(gigs)")}:
             conn.execute("ALTER TABLE gigs ADD COLUMN mod TEXT NOT NULL DEFAULT 'ok'")

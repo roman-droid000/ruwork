@@ -39,7 +39,7 @@ class HideIn(BaseModel):
 # ---------- Заявки: пополнения, возвраты, выводы ----------
 
 OPS_SQL = (
-    "SELECT o.id, o.user_id, o.t, o.coins, o.fee, o.status, o.dest, o.phone, o.ts, u.name, " + CONTACT_SQL + " AS email"
+    "SELECT o.id, o.user_id, o.t, o.method, o.inv_id, o.coins, o.fee, o.status, o.dest, o.phone, o.ts, u.name, " + CONTACT_SQL + " AS email"
     " FROM wallet_ops o JOIN users u ON u.id = o.user_id WHERE o.t IN ('dep', 'wd', 'rf')"
 )
 
@@ -91,6 +91,9 @@ def op_decide(op_id: str, act: str, staff=Depends(auth.require_admin), conn: sql
         o = conn.execute("SELECT * FROM wallet_ops WHERE id = ? AND t IN ('dep', 'wd', 'rf')", (op_id,)).fetchone()
         if not o or o["status"] != "pending":
             raise HTTPException(400, "Заявка уже обработана")
+        if act == "approve" and o["t"] == "dep" and o["inv_id"] is not None:
+            raise HTTPException(400, "Пополнение через Robokassa зачисляется само после оплаты. "
+                                     "Если деньги пришли, а монеты нет — проверьте счёт в кабинете Robokassa и начислите корректировкой.")
         if act == "approve" and o["t"] == "dep":
             add_coins(conn, o["user_id"], o["coins"])
         elif act == "approve" and o["t"] == "wd":

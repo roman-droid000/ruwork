@@ -7,10 +7,10 @@ import time
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from .. import auth, guard
+from .. import auth, guard, pay
 from ..db import get_db, now_ms, tx
 from ..logic import (
-    BANKS, DEP_AMOUNTS, DEP_AMOUNTS_TEXT, MIN_WD, PLATFORM_CANCEL_PCT, REFUND_WORK_PCT, ST_CANCEL, ST_WAIT, ST_WORK, TIERS,
+    BANKS, DEP_AMOUNTS, DEP_AMOUNTS_TEXT, DEP_METHODS, MIN_WD, PLATFORM_CANCEL_PCT, REFUND_WORK_PCT, ST_CANCEL, ST_WAIT, ST_WORK, TIERS,
     add_bonus, add_coins, add_op, fee_of, get_bonus, get_coins, get_wallet, linked, mk_tiers, new_id, nf, notify, platform_add,
     platform_bonus, refund_order, rub, spend,
     user_state, VISIBLE_SQL,
@@ -31,6 +31,7 @@ class OrderIn(BaseModel):
 
 class DepositIn(BaseModel):
     amount: float
+    method: str = "sbp"
 
 
 class RefundIn(BaseModel):
@@ -164,15 +165,41 @@ def sales_seen(user=Depends(auth.require_user), conn: sqlite3.Connection = Depen
     return {"ok": True}
 
 
+def gw_pay_url(conn: sqlite3.Connection, user, op: sqlite3.Row) -> str:
+    email = user["email"] if user["email"] and "@" in user["email"] else ""
+    return pay.payment_url(op["inv_id"], op["coins"], f"Пополнение баланса RUWORK: {nf(op['coins'])} монет",
+                           op["method"], email)
+
+
 @router.post("/wallet/deposit")
 def deposit(body: DepositIn, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
+    """Пополнение выбранным способом (DEP_METHODS). Со шлюзом (app/pay.py) создаётся счёт и возвращается
+    pay_url — монеты зачисляются по уведомлению шлюза об оплате. Без шлюза — заявка для администратора."""
     a = int_amount(body.amount)
     if a not in DEP_AMOUNTS:
         raise HTTPException(400, f"Выберите сумму пополнения: {DEP_AMOUNTS_TEXT} монет")
+    if body.method not in DEP_METHODS:
+        raise HTTPException(400, "Выберите способ оплаты")
+    guard.throttle("dep:" + user["id"], (10, 600), "Слишком много попыток пополнения — подождите 10 минут")
     with tx(conn):
-        add_op(conn, user["id"], "dep", "sbp", a, "pending")
-        guard.alert(f"Заявка на пополнение: {user['name']} — {nf(a)} мон.", "#/admin/ops")
-        return user_state(conn, user["id"])
+        if not pay.enabled():
+            add_op(conn, user["id"], "dep", body.method, a, "pending")
+            guard.alert(f"Заявка на пополнение: {user['name']} — {nf(a)} мон. ({DEP_METHODS[body.method]})", "#/admin/ops")
+            return user_state(conn, user["id"])
+        inv = conn.execute("SELECT coalesce(max(inv_id), 1000) + 1 FROM wallet_ops").fetchone()[0]
+        op_id = add_op(conn, user["id"], "dep", body.method, a, "pending", "Robokassa · ожидает оплаты")
+        conn.execute("UPDATE wallet_ops SET inv_id = ? WHERE id = ?", (inv, op_id))
+        op = conn.execute("SELECT * FROM wallet_ops WHERE id = ?", (op_id,)).fetchone()
+        return {**user_state(conn, user["id"]), "pay_url": gw_pay_url(conn, user, op)}
+
+
+@router.post("/wallet/deposit/{op_id}/pay")
+def deposit_pay(op_id: str, user=Depends(auth.require_user), conn: sqlite3.Connection = Depends(get_db)):
+    """Ссылка на оплату ещё не оплаченного пополнения — если покупатель закрыл страницу шлюза."""
+    op = conn.execute("SELECT * FROM wallet_ops WHERE id = ? AND user_id = ? AND t = 'dep'", (op_id, user["id"])).fetchone()
+    if not op or op["status"] != "pending" or op["inv_id"] is None or not pay.enabled():
+        raise HTTPException(400, "Это пополнение уже нельзя оплатить. Создайте новое.")
+    return {"pay_url": gw_pay_url(conn, user, op)}
 
 
 @router.post("/wallet/refund")

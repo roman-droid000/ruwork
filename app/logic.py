@@ -27,6 +27,8 @@ AUTO_CONFIRM_MS = 7 * 86_400_000  # заказ «На проверке» под�
 DEP_AMOUNTS = [100, 300, 500, 1000, 2000, 3000, 5000, 10_000]
 MIN_DEP, MAX_DEP = min(DEP_AMOUNTS), max(DEP_AMOUNTS)
 DEP_AMOUNTS_TEXT = ", ".join(f"{a:,}".replace(",", " ") for a in DEP_AMOUNTS[:-1]) + f" или {DEP_AMOUNTS[-1]:,}".replace(",", " ")
+DEP_METHODS = {"sbp": "СБП", "card": "Банковская карта"}  # способы пополнения на выбор (app/pay.py — шлюз Robokassa)
+DEP_UNPAID_MS = 86_400_000  # неоплаченное пополнение через шлюз отменяется через сутки
 MIN_WD, WD_FEE, WD_MIN_FEE = 500, 0.05, 10
 BANKS = ["Сбербанк", "Т-Банк", "ВТБ", "Альфа-Банк", "Другой банк"]
 
@@ -382,7 +384,8 @@ def user_state(conn: sqlite3.Connection, user_id: str) -> dict:
         "SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC, rowid DESC", (user_id,)
     ).fetchall()
     ops = conn.execute(
-        "SELECT id, t, method, coins, fee, status, dest, ts FROM wallet_ops WHERE user_id = ? ORDER BY ts DESC, rowid DESC",
+        "SELECT id, t, method, coins, fee, status, dest, ts, inv_id IS NOT NULL AS gw FROM wallet_ops"
+        " WHERE user_id = ? ORDER BY ts DESC, rowid DESC",
         (user_id,),
     ).fetchall()
     # Диалоги по своим объявлениям, где последнее сообщение от покупателя (ждут ответа продавца).

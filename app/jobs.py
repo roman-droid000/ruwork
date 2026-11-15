@@ -25,7 +25,7 @@ from pathlib import Path
 
 from . import guard, tg
 from .db import DB_PATH, ROOT, connect, now_ms, tx
-from .logic import DAY_MS, ST_REVIEW, ST_WAIT, ST_WORK, deadline, notify, tick
+from .logic import DAY_MS, DEP_UNPAID_MS, ST_REVIEW, ST_WAIT, ST_WORK, deadline, notify, tick
 
 log = logging.getLogger("ruwork.jobs")
 
@@ -74,6 +74,10 @@ def run_once() -> None:
             remind_deadlines(conn)
             conn.execute("UPDATE users SET blocked_at = NULL, block_reason = '', blocked_until = NULL"
                          " WHERE blocked_until IS NOT NULL AND blocked_until <= ?", (now_ms(),))
+            # Неоплаченные пополнения через шлюз: если оплата всё же придёт, /api/pay/robokassa/result зачислит её.
+            conn.execute("UPDATE wallet_ops SET status = 'cancelled', dest = 'Robokassa · не оплачено'"
+                         " WHERE t = 'dep' AND status = 'pending' AND inv_id IS NOT NULL AND ts < ?",
+                         (now_ms() - DEP_UNPAID_MS,))
         status["tick_at"] = now_ms()
     finally:
         conn.close()

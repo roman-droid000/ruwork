@@ -27,6 +27,7 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 ADMIN_EMAIL, ADMIN_PASSWORD = "phantom.crypta@mail.ru", "Admin-e2e-12345"
+RK_PASS1, RK_PASS2 = "e2e-pass-one", "e2e-pass-two"  # ненастоящий магазин Robokassa для прогона
 failures: list[str] = []
 
 
@@ -104,7 +105,10 @@ def start(tmp: Path, db: Path, log: str, **extra) -> tuple[subprocess.Popen, str
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="ruwork-e2e-"))
     db = tmp / "e2e.db"
-    for log, extra, phase in (("server.log", {}, run), ("server-mfa.log", {"RUWORK_TG_TOKEN": "0:e2e-fake", "RUWORK_TG_BOT": "e2e_bot"}, run_mfa)):
+    for log, extra, phase in (("server.log", {}, run), ("server-mfa.log", {"RUWORK_TG_TOKEN": "0:e2e-fake", "RUWORK_TG_BOT": "e2e_bot"}, run_mfa),
+                              ("server-pay.log", {"ROBOKASSA_LOGIN": "e2e-shop", "ROBOKASSA_PASS1": RK_PASS1,
+                                                  "ROBOKASSA_PASS2": RK_PASS2, "ROBOKASSA_TEST": "1",
+                                                  "ROBOKASSA_LABEL_CARD": "BankCardE2E"}, run_pay)):
         server, base = start(tmp, db, log, **extra)
         try:
             phase(base, db, tmp)
@@ -691,6 +695,85 @@ def run_mfa(base: str, db: Path, tmp: Path) -> None:
     row = c.execute("SELECT code FROM tg_regs WHERE token = ?", (reg_hash(t3),)).fetchone()
     check("с тем же номером и Telegram можно зарегистрироваться заново", row and row[0], row)
     c.close()
+
+
+def run_pay(base: str, db: Path, tmp: Path) -> None:
+    """Сервер с настроенной Robokassa (магазин ненастоящий): уведомления об оплате подписываем сами паролем #2."""
+    import hashlib
+    from urllib.parse import parse_qs, urlparse
+
+    def rk(out_sum: str, inv: int, password: str = RK_PASS2) -> bytes:
+        sig = hashlib.md5(f"{out_sum}:{inv}:{password}".encode()).hexdigest().upper()
+        return f"OutSum={out_sum}&InvId={inv}&SignatureValue={sig}".encode()
+
+    form = "application/x-www-form-urlencoded"
+    step("22. Пополнение через Robokassa на выбор: СБП или карта")
+    sfx = str(int(time.time()))[-6:]
+    pw = "Passw0rd-pay"
+    u = Client(base, "10.0.4.1")
+    u.ok("POST", "/api/auth/register", {"name": "Плательщик" + sfx, "email": f"p{sfx}@e2e.test", "password": pw,
+                                        "password2": pw, "terms": True})
+    meta = u.ok("GET", "/api/meta")
+    check("сайт знает о шлюзе и способах", meta.get("pay_gw") == "robokassa" and set(meta["dep_methods"]) == {"sbp", "card"}, meta)
+    code, _ = u.call("POST", "/api/wallet/deposit", {"amount": 500, "method": "crypto"})
+    check("неизвестный способ отклонён", code == 400, code)
+    r = u.ok("POST", "/api/wallet/deposit", {"amount": 500, "method": "card"})
+    q = {k: v[0] for k, v in parse_qs(urlparse(r["pay_url"]).query).items()}
+    op = r["wallet"]["ops"][0]
+    inv = int(q["InvId"])
+    check("ссылка на оплату: магазин, сумма, тестовый режим, способ «карта»",
+          r["pay_url"].startswith("https://auth.robokassa.ru/") and q["MerchantLogin"] == "e2e-shop" and q["OutSum"] == "500.00"
+          and q["IsTest"] == "1" and q["IncCurrLabel"] == "BankCardE2E" and q["Email"] == f"p{sfx}@e2e.test", q)
+    check("подпись ссылки — паролем #1",
+          q["SignatureValue"] == hashlib.md5(f"e2e-shop:500.00:{inv}:{RK_PASS1}".encode()).hexdigest(), q)
+    check("операция ждёт оплаты, монет ещё нет", op["status"] == "pending" and op["gw"] and op["method"] == "card"
+          and r["wallet"]["coins"] == 0, op)
+    q2 = {k: v[0] for k, v in parse_qs(urlparse(u.ok("POST", "/api/wallet/deposit", {"amount": 300, "method": "sbp"})["pay_url"]).query).items()}
+    check("способ «СБП» без IncCurrLabel — выбор на странице Robokassa", "IncCurrLabel" not in q2 and int(q2["InvId"]) == inv + 1, q2)
+    admin = Client(base, "10.0.0.3")
+    admin.ok("POST", "/api/auth/login", {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
+    code, err = admin.call("POST", f"/api/admin/ops/{op['id']}/approve")
+    check("администратор не может одобрить неоплаченное пополнение", code == 400 and "Robokassa" in str(err), err)
+    nobody = Client(base, "10.0.4.9")
+    code, text = nobody.call("POST", "/api/pay/robokassa/result", raw=rk("500.00", inv, "wrong"), ctype=form)
+    check("уведомление с чужой подписью отклонено", code == 400 and u.ok("GET", "/api/state")["wallet"]["coins"] == 0, (code, text))
+    code, text = nobody.call("POST", "/api/pay/robokassa/result", raw=rk("5.00", inv), ctype=form)
+    check("уведомление с другой суммой отклонено", code == 400 and u.ok("GET", "/api/state")["wallet"]["coins"] == 0, (code, text))
+    code, text = nobody.call("POST", "/api/pay/robokassa/result", raw=rk("500.000000", inv), ctype=form)
+    w = u.ok("GET", "/api/state")["wallet"]
+    check("оплата подтверждена: ответ OK<InvId>, монеты в авансе", code == 200 and text == f"OK{inv}" and w["coins"] == 500
+          and w["adv"] == 500 and w["ops"][1]["status"] == "done", (code, text, w["coins"]))
+    code, text = nobody.call("POST", "/api/pay/robokassa/result", raw=rk("500.000000", inv), ctype=form)
+    check("повторное уведомление не начисляет второй раз", text == f"OK{inv}" and u.ok("GET", "/api/state")["wallet"]["coins"] == 500)
+    check("пользователь получил уведомление", any("пополнен" in n["text"] for n in u.ok("GET", "/api/notifications")["items"]))
+    redir = urllib.request.build_opener(type("NoRedirect", (urllib.request.HTTPRedirectHandler,),
+                                             {"redirect_request": lambda *a, **k: None}))
+    sig1 = hashlib.md5(f"500.00:{inv}:{RK_PASS1}".encode()).hexdigest()
+    try:
+        redir.open(f"{base}/api/pay/robokassa/success?OutSum=500.00&InvId={inv}&SignatureValue={sig1}", timeout=10)
+        loc = ""
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location", "")
+    check("Success URL возвращает в кошелёк", loc == "/?pay=ok#/dashboard/wallet", loc)
+    dep2 = u.ok("GET", "/api/state")["wallet"]["ops"][0]
+    check("неоплаченное можно оплатить позже", u.ok("POST", f"/api/wallet/deposit/{dep2['id']}/pay")["pay_url"].startswith("https://"))
+    c = sqlite3.connect(db)
+    c.execute("UPDATE wallet_ops SET ts = ts - 2 * 86400000 WHERE id = ?", (dep2["id"],))
+    c.commit()
+    c.close()
+    expired = False
+    for _ in range(15):
+        if next(o for o in u.ok("GET", "/api/state")["wallet"]["ops"] if o["id"] == dep2["id"])["status"] == "cancelled":
+            expired = True
+            break
+        time.sleep(1)
+    check("через сутки неоплаченное пополнение отменяется само", expired)
+    code, text = nobody.call("POST", "/api/pay/robokassa/result", raw=rk("300.00", inv + 1), ctype=form)
+    check("оплата, пришедшая после отмены, всё равно зачисляется", text == f"OK{inv + 1}"
+          and u.ok("GET", "/api/state")["wallet"]["coins"] == 800, (code, text))
+    code, _ = u.call("POST", "/api/wallet/deposit", {"amount": 1500, "method": "card"})
+    check("и через шлюз — только суммы из списка", code == 400, code)
+    check("сверка после пополнений через шлюз — без расхождений", admin.ok("GET", "/api/admin/reconcile")["bad"] == [])
 
 
 if __name__ == "__main__":
