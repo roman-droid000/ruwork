@@ -84,7 +84,8 @@ def static(path: str, request: Request):
     if host.startswith("www."):
         return RedirectResponse(f"https://{host[4:]}/", 301)
     target = (PUBLIC / path).resolve()
-    if path and target.is_relative_to(PUBLIC) and target.is_file() and target.suffix != ".html":
+    if path and target.is_relative_to(PUBLIC) and target.is_file() and (target.suffix != ".html" or target.name.startswith("yandex_")):
+        # yandex_*.html — файл подтверждения прав на сайт в Яндекс Вебмастере
         return FileResponse(target, headers={"Cache-Control": "public, max-age=3600"})
     if path:
         return RedirectResponse("/", 301)
