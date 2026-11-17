@@ -451,6 +451,10 @@ def init_db() -> None:
         # Миграция: сброс пароля кнопкой из Telegram (sha256 одноразового токена).
         if "token" not in {r[1] for r in conn.execute("PRAGMA table_info(password_resets)")}:
             conn.execute("ALTER TABLE password_resets ADD COLUMN token TEXT")
+        # Миграция: сброс пароля по коду из Telegram-бота (token — sha256 билета, code — sha256 кода, tries — неверные вводы).
+        if "code" not in {r[1] for r in conn.execute("PRAGMA table_info(password_resets)")}:
+            conn.execute("ALTER TABLE password_resets ADD COLUMN code TEXT")
+            conn.execute("ALTER TABLE password_resets ADD COLUMN tries INTEGER NOT NULL DEFAULT 0")
         # Миграция: напоминания продавцу о сроке (1 — «остались сутки», 2 — «срок прошёл»).
         if "dl_reminded" not in {r[1] for r in conn.execute("PRAGMA table_info(orders)")}:
             conn.execute("ALTER TABLE orders ADD COLUMN dl_reminded INTEGER NOT NULL DEFAULT 0")
@@ -493,6 +497,13 @@ def init_db() -> None:
             conn.execute("ALTER TABLE wallets ADD COLUMN bonus INTEGER NOT NULL DEFAULT 0")
         if "paid_bonus" not in {r[1] for r in conn.execute("PRAGMA table_info(orders)")}:
             conn.execute("ALTER TABLE orders ADD COLUMN paid_bonus INTEGER NOT NULL DEFAULT 0")
+        # Миграция: комиссия фиксируется при оплате заказа; отмена заказа «В работе» — по запросу покупателя.
+        ocols = {r[1] for r in conn.execute("PRAGMA table_info(orders)")}
+        if "fee_pct" not in ocols:
+            conn.execute("ALTER TABLE orders ADD COLUMN fee_pct REAL")
+        if "cancel_req_at" not in ocols:
+            conn.execute("ALTER TABLE orders ADD COLUMN cancel_req_at INTEGER")
+            conn.execute("ALTER TABLE orders ADD COLUMN cancel_reason TEXT NOT NULL DEFAULT ''")
         ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
         if "ref_by" not in ucols:
             conn.execute("ALTER TABLE users ADD COLUMN ref_by TEXT")

@@ -19,14 +19,10 @@ WORK_MS = 86_400_000  # «В работе» → «Выполнен»
 # объявления настоящих продавцов. Услуги остаются в базе, True возвращает их в каталог.
 DEMO_CATALOG = False
 PREMOD_FIRST = 3  # при включённой премодерации столько первых объявлений продавца проверяет администрация
-REFUND_WORK_PCT = 90  # возврат при отмене заказа «В работе»; до подтверждения возвращается 100 %
-SALE_FEE_PCT = 11.5  # комиссия с каждой завершённой продажи: 8,5 % платёжной системе, 3 % пригласившему или платформе
-PLATFORM_CANCEL_PCT = 5  # из удержанных 10 % платформе; остальное — продавцу за начатую работу
+SALE_FEE_PCT = 6  # комиссия с каждой завершённой продажи: 3 % платёжной системе, 3 % пригласившему или платформе
+CANCEL_ANSWER_MS = 2 * 86_400_000  # за столько продавец должен ответить на запрос отмены, иначе покупатель открывает спор
 AUTO_CONFIRM_MS = 7 * 86_400_000  # заказ «На проверке» подтверждается сам через 7 дней
-# Пополнение — только на эти суммы: платёжной системе нужен каталог с фиксированными ценами.
-DEP_AMOUNTS = [100, 300, 500, 1000, 2000, 3000, 5000, 10_000]
-MIN_DEP, MAX_DEP = min(DEP_AMOUNTS), max(DEP_AMOUNTS)
-DEP_AMOUNTS_TEXT = ", ".join(f"{a:,}".replace(",", " ") for a in DEP_AMOUNTS[:-1]) + f" или {DEP_AMOUNTS[-1]:,}".replace(",", " ")
+MIN_DEP, MAX_DEP = 100, 100_000  # пополнение — любой целой суммой в этих пределах
 DEP_METHODS = {"sbp": "СБП", "card": "Банковская карта"}  # способы пополнения на выбор (app/pay.py — шлюз Robokassa)
 DEP_UNPAID_MS = 86_400_000  # неоплаченное пополнение через шлюз отменяется через сутки
 MIN_WD, WD_FEE, WD_MIN_FEE = 500, 0.05, 10
@@ -51,11 +47,12 @@ RESP_MIN_SAMPLES = 3  # меньше ответов — время ответа 
 DAY_MS = 86_400_000
 EXT_MAX_DAYS = 7  # на сколько дней продавец может попросить продлить срок за один запрос
 VACATION_MAX_MS = 90 * DAY_MS
-FEE_FREE_MS = 7 * DAY_MS  # первую неделю после регистрации продавец работает без комиссии
+FEE_FREE_MS = 7 * DAY_MS  # первую неделю с первого оплаченного заказа продавец работает без комиссии
 FEE_LOW_MS = 21 * DAY_MS  # следующие 2 недели (2-я и 3-я) — сниженная комиссия FEE_LOW_PCT
-FEE_LOW_PCT = 9  # = платёжная система 8,5 % + доля пригласившего 0,5 %: платформе в этот период ничего
+FEE_LOW_PCT = 3.5  # = платёжная система 3 % + доля пригласившего 0,5 % (без пригласившего — платформе)
+LEGACY_LOW_PCT = 9  # сниженная ставка до снижения комиссии платёжной системы (16.11.2026) — у заказов, оплаченных раньше
 REF_PCT = 3  # пригласивший получает столько % от суммы каждой продажи приглашённого (из комиссии, не больше неё)
-PAY_SYS_PCT = 8.5  # из комиссии с продажи столько % от суммы продажи уходит платёжной системе (учитывается отдельно)
+PAY_SYS_PCT = 3  # из комиссии с продажи столько % от суммы продажи уходит платёжной системе (учитывается отдельно)
 REF_LOW_PCT = 0.5  # ...а пока у приглашённого сниженная комиссия FEE_LOW_PCT (2-я и 3-я недели) — столько
 REF_MS = 180 * DAY_MS  # сколько после регистрации приглашённого действует эта доля
 WELCOME_BONUS = 150  # приветственный бонус на заказы новым пользователям
@@ -209,23 +206,36 @@ def sale_fee(amount: int, pct: float = SALE_FEE_PCT) -> int:
     return pct_part(amount, pct, up=True)
 
 
-def fee_pct(conn: sqlite3.Connection, seller_id) -> int:
-    """Комиссия продавца в процентах по возрасту аккаунта: первая неделя 0, следующие 2 недели FEE_LOW_PCT,
-    потом SALE_FEE_PCT."""
-    r = conn.execute("SELECT created_at FROM users WHERE id = ?", (seller_id,)).fetchone() if seller_id else None
-    return fee_by_age(now_ms() - r["created_at"]) if r else SALE_FEE_PCT
+def fee_start(conn: sqlite3.Connection, seller_id) -> int | None:
+    """С какого момента отсчитываются льготные недели продавца: первый оплаченный ему заказ (None — заказов не было)."""
+    return conn.execute("SELECT min(created_at) FROM orders WHERE seller_id = ?", (seller_id,)).fetchone()[0]
 
 
-def fee_by_age(age_ms: int) -> int:
+def fee_pct(conn: sqlite3.Connection, seller_id) -> float:
+    """Текущая ставка комиссии продавца: 7 дней с первого оплаченного заказа — 0, следующие 14 дней — FEE_LOW_PCT,
+    потом SALE_FEE_PCT. Пока заказов не было, неделя без комиссии ещё не началась (0)."""
+    if not seller_id:
+        return SALE_FEE_PCT
+    start = fee_start(conn, seller_id)
+    return fee_by_age(now_ms() - start if start else 0)
+
+
+def order_fee_pct(conn: sqlite3.Connection, o) -> float:
+    """Ставка заказа фиксируется при оплате (orders.fee_pct); у заказов, оплаченных до этого правила, — текущая."""
+    return o["fee_pct"] if o["fee_pct"] is not None else fee_pct(conn, o["seller_id"])
+
+
+def fee_by_age(age_ms: int) -> float:
     return 0 if age_ms < FEE_FREE_MS else FEE_LOW_PCT if age_ms < FEE_LOW_MS else SALE_FEE_PCT
 
 
-def take_fee(conn: sqlite3.Connection, seller_id, fee: int, order_id, note: str, amount: int = 0) -> None:
+def take_fee(conn: sqlite3.Connection, seller_id, fee: int, order_id, note: str, amount: int = 0,
+             pct_fee: float | None = None) -> None:
     """Деньги с завершённой продажи на сумму amount сверх того, что получил продавец (fee — комиссия).
     1. Платёжная система берёт PAY_SYS_PCT % с каждой продажи — всегда, даже когда у новичка комиссии нет:
        пишется в platform_ops с kind = "pay_sys" и в баланс платформы не входит.
     2. Пока с регистрации продавца не прошло REF_MS, пригласивший получает из комиссии REF_PCT % от суммы продажи,
-       а пока у продавца сниженная комиссия (2-я и 3-я недели) — REF_LOW_PCT % (не больше самой комиссии).
+       а если ставка заказа сниженная (FEE_LOW_PCT, pct_fee) — REF_LOW_PCT % (не больше самой комиссии).
        Доля пригласившему — заработок, его можно вывести.
     3. Остаток — платформе (sale_fee). Если комиссии не хватает на платёжную систему (первая неделя без комиссии),
        разницу платформа доплачивает из своих: запись kind = "pay_cover" с минусом."""
@@ -233,7 +243,7 @@ def take_fee(conn: sqlite3.Connection, seller_id, fee: int, order_id, note: str,
     ref = 0
     r = conn.execute("SELECT ref_by, created_at FROM users WHERE id = ?", (seller_id,)).fetchone() if seller_id and fee > 0 else None
     if r and r["ref_by"] and now_ms() - r["created_at"] < REF_MS:
-        pct = REF_LOW_PCT if now_ms() - r["created_at"] < FEE_LOW_MS else REF_PCT
+        pct = REF_LOW_PCT if pct_fee in (FEE_LOW_PCT, LEGACY_LOW_PCT) else REF_PCT
         ref = min(max(0, fee - pay), pct_part(amount, pct))  # доля — только из остатка после платёжной системы
         if ref:
             add_coins(conn, r["ref_by"], ref, ref)
@@ -290,13 +300,13 @@ def complete_order(conn: sqlite3.Connection, o: sqlite3.Row, auto: bool = False,
         return False
     # Оплата через СБП в демо не проверяется, поэтому продавцу переводятся только монеты с баланса покупателя.
     paid = o["method"] == "bal" and o["seller_id"]
-    pct = fee_pct(conn, o["seller_id"])
+    pct = order_fee_pct(conn, o)
     fee = sale_fee(o["amount"], pct)
     net = o["amount"] - fee
     if paid:
         add_coins(conn, o["seller_id"], net, net)
         add_op(conn, o["seller_id"], "sale", "bal", net, "done", f"{o['num']} · {o['title']}", fee)
-        take_fee(conn, o["seller_id"], fee, o["id"], f"{o['num']} · {o['title']}", o["amount"])
+        take_fee(conn, o["seller_id"], fee, o["id"], f"{o['num']} · {o['title']}", o["amount"], pct)
     who = ("Спор решён в пользу продавца" if by_admin else
            "Получение подтверждено автоматически: прошло 7 дней" if auto else "Покупатель подтвердил получение")
     link = f"#/order/{o['id']}"
@@ -432,10 +442,12 @@ def perks(conn: sqlite3.Connection, user_id: str) -> dict:
     invited = conn.execute("SELECT count(*) FROM users WHERE ref_by = ? AND deleted_at IS NULL", (user_id,)).fetchone()[0]
     earned = conn.execute("SELECT coalesce(sum(coins), 0) FROM wallet_ops WHERE user_id = ? AND t = 'refb'",
                           (user_id,)).fetchone()[0]
-    n, created = now_ms(), u["created_at"]
-    free_until, low_until = created + FEE_FREE_MS, created + FEE_LOW_MS
-    return {"fee_free_until": free_until if free_until > n else None, "fee_low_until": low_until if low_until > n else None,
-            "fee_low_pct": FEE_LOW_PCT, "fee_now": fee_by_age(n - created), "fee_pct": SALE_FEE_PCT,
+    n, start = now_ms(), fee_start(conn, user_id)
+    free_until = start + FEE_FREE_MS if start else None
+    low_until = start + FEE_LOW_MS if start else None
+    return {"fee_started": bool(start), "fee_free_until": free_until if free_until and free_until > n else None,
+            "fee_low_until": low_until if low_until and low_until > n else None,
+            "fee_low_pct": FEE_LOW_PCT, "fee_now": fee_pct(conn, user_id), "fee_pct": SALE_FEE_PCT,
             "ref": {"invited": invited, "earned": earned, "pct": REF_PCT, "pct_low": REF_LOW_PCT, "code": ref_code(conn, user_id),
                     "list": [dict(r) for r in conn.execute(
                         "SELECT name, created_at AS ts FROM users WHERE ref_by = ? AND deleted_at IS NULL"
@@ -607,7 +619,8 @@ def resolve_dispute(conn: sqlite3.Connection, o: sqlite3.Row, act: str) -> None:
     bal = o["method"] == "bal"
     refund = o["amount"] if act == "buyer" else o["amount"] // 2
     part = o["amount"] - refund
-    fee = sale_fee(part, fee_pct(conn, o["seller_id"])) if part else 0
+    pct = order_fee_pct(conn, o)
+    fee = sale_fee(part, pct) if part else 0
     note = f"{o['num']} · {o['title']}"
     if bal:
         refund_order(conn, o, refund)
@@ -615,7 +628,7 @@ def resolve_dispute(conn: sqlite3.Connection, o: sqlite3.Row, act: str) -> None:
         if part and o["seller_id"]:
             add_coins(conn, o["seller_id"], part - fee, part - fee)
             add_op(conn, o["seller_id"], "sale", "bal", part - fee, "done", note, fee)
-            take_fee(conn, o["seller_id"], fee, o["id"], note, part)
+            take_fee(conn, o["seller_id"], fee, o["id"], note, part, pct)
     if act == "buyer":
         text = f"Спор по заказу {o['num']} решён в пользу покупателя." + (f" Покупателю возвращено {rub(refund)}." if bal else "")
         nb, ns = (f"Спор по заказу {o['num']} решён в вашу пользу." + (f" Возвращено {rub(refund)}." if bal else ""),

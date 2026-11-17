@@ -155,6 +155,7 @@ def order_detail(conn: sqlite3.Connection, o: sqlite3.Row, role: str) -> dict:
         "started_at": o["started_at"], "delivered_at": o["delivered_at"], "reviewed_at": o["reviewed_at"],
         "days": o["days"], "extra_days": o["extra_days"], "deadline": deadline(o),
         "revs": o["revs"], "revs_used": o["revs_used"], "ext_days": o["ext_days"], "ext_reason": o["ext_reason"],
+        "cancel_req_at": o["cancel_req_at"], "cancel_reason": o["cancel_reason"],
     }
 
 

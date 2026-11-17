@@ -250,8 +250,10 @@ def detail(conn: sqlite3.Connection, user: sqlite3.Row, order_id: str) -> dict:
     d["chat"] = chat_messages(conn, o) if o["seller_id"] else []
     started = o["started_at"] or o["created_at"] + CONFIRM_MS
     days = TIER_DAYS.get(o["tier_name"])
+    real_dl = d["deadline"]  # срок с продлениями (logic.deadline) — по нему решается, можно ли отменить без согласия
     d["deadline"] = started + days * 86_400_000 if days else None
     d["now"] = now_ms()
+    d["cancel_now"] = o["status"] == "Ожидает подтверждения" or bool(o["status"] == "В работе" and real_dl and real_dl < d["now"])
     return d
 
 
@@ -295,7 +297,9 @@ def order_action(order_id: str, act: str, body: TextIn | None = None, user=Depen
     if act == "confirm":
         order_routes.confirm(order_id, user=user, conn=conn)
     elif act == "cancel":
-        money.cancel_order(order_id, user=user, conn=conn)
+        money.cancel_order(order_id, money.CancelIn(reason=text), user=user, conn=conn)
+    elif act in ("cancel-accept", "cancel-decline"):
+        money.answer_cancel(order_id, act.split("-")[1], user=user, conn=conn)
     elif act == "dispute":
         order_routes.open_dispute(order_id, order_routes.DisputeIn(reason=text), user=user, conn=conn)
     elif act == "dispute-close":

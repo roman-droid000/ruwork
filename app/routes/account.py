@@ -6,7 +6,6 @@ import secrets
 import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from .. import auth, guard, tg
@@ -21,7 +20,9 @@ LOGIN_PER_EMAIL = (10, 900)  # неудачных входов в один ак�
 REGISTER_PER_IP = (5, 3600)
 RESET_PER_IP = (5, 3600)
 RESET_PER_EMAIL = (3, 3600)
-RESET_TG_TTL_MS = 30 * 60 * 1000  # ссылка подтверждения сброса из Telegram действует 30 минут
+RESET_CODE_TTL_MS = 10 * 60 * 1000  # код сброса пароля из Telegram действует 10 минут
+RESET_CODE_TRIES = 5
+RESET_RESEND = (3, 600)
 DUMMY_SALT = b"\0" * 16  # хэш для несуществующего email: время ответа не выдаёт, есть ли аккаунт
 
 
@@ -56,10 +57,8 @@ LOGIN_RESEND = (3, 600)
 
 
 class ResetIn(BaseModel):
-    email: str
-    password: str
-    password2: str
-    contact: str
+    phone: str = ""
+    email: str = ""  # старые версии страницы присылали логин в этом поле — принимается, только если это телефон
 
 
 class NameIn(BaseModel):
@@ -267,76 +266,96 @@ def login_resend(body: LoginCodeIn, conn: sqlite3.Connection = Depends(get_db)):
 
 @router.post("/auth/reset")
 def request_reset(body: ResetIn, request: Request, conn: sqlite3.Connection = Depends(get_db)):
-    """Заявка на сброс пароля. Если к аккаунту привязан Telegram, бот присылает кнопку подтверждения
-    и пароль меняется сразу по ней. Иначе (или если кнопку не нажали) решает администратор."""
-    contact = esc(body.contact.strip())[:100]
-    if not (auth.norm_phone(body.email) or auth.EMAIL_RE.match(body.email.strip())) or len(body.email) > 120:
-        raise HTTPException(400, "Введите телефон или email аккаунта")
-    if auth.password_error(body.password) or len(body.password) > 100:
-        raise HTTPException(400, "Новый пароль: минимум 8 символов, буквы и цифры")
-    if body.password != body.password2:
-        raise HTTPException(400, "Пароли не совпадают")
-    if len(contact) < 3:
-        raise HTTPException(400, "Укажите контакт для связи: Telegram или телефон")
-    email = auth.login_key(body.email)
-    keys = ("reset-ip:" + guard.client_ip(request), "reset-email:" + email)
+    """Восстановление пароля из окна входа, шаг 1 — только по номеру телефона: бот RUWORK присылает 6-значный код
+    в Telegram, привязанный к аккаунту с этим номером.
+    Шаг 2 — код и новый пароль (POST /auth/reset/code). Заявок администратору больше нет: без Telegram код не придёт,
+    и окно предлагает написать в поддержку. Ответ одинаковый, есть аккаунт или нет, чтобы по форме нельзя было проверить,
+    зарегистрирован ли телефон или email: билет выдаётся всегда, но без аккаунта с Telegram код к нему не подойдёт."""
+    phone = auth.norm_phone((body.phone or body.email)[:40])
+    if not phone:
+        raise HTTPException(400, "Введите номер телефона аккаунта, например +7 900 000-00-00")
+    keys = ("reset-ip:" + guard.client_ip(request), "reset-email:" + phone)
     if guard.limited(keys[0], RESET_PER_IP) or guard.limited(keys[1], RESET_PER_EMAIL):
-        raise HTTPException(429, "Слишком много заявок — попробуйте через час")
+        raise HTTPException(429, "Слишком много попыток — попробуйте через час")
     guard.hit(keys[0])
     guard.hit(keys[1])
-    salt, pw_hash = auth.new_password(body.password)  # считаем всегда, чтобы время ответа не выдавало наличие аккаунта
-    user = auth.find_user(conn, body.email)
-    # Ответ одинаковый, есть аккаунт или нет, чтобы по форме нельзя было проверить, зарегистрирован ли email.
-    # Пароль администратора через заявку не сбрасывается: он меняется только в профиле.
-    if user is not None and not auth.is_admin(user) and user["blocked_at"] is None:
-        token = secrets.token_urlsafe(24) if user["tg_chat"] and tg.TOKEN else None
+    user = conn.execute("SELECT * FROM users WHERE phone = ? AND deleted_at IS NULL", (phone,)).fetchone()
+    ticket = secrets.token_urlsafe(24)
+    if user is not None and user["blocked_at"] is None and user["tg_chat"] and tg.TOKEN:
         with tx(conn):
             conn.execute("DELETE FROM password_resets WHERE user_id = ? AND status = 'pending'", (user["id"],))
+            rid = new_id("pr")
             conn.execute(
                 "INSERT INTO password_resets(id, user_id, contact, salt, hash, status, ts, token)"
-                " VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-                (new_id("pr"), user["id"], contact, salt, pw_hash, now_ms(), token_hash(token) if token else None),
+                " VALUES (?, ?, 'telegram', '', '', 'pending', ?, ?)",
+                (rid, user["id"], now_ms(), token_hash(ticket)),
             )
-        if token:
-            tg.send_button(user["tg_chat"],
-                           "Кто-то запросил смену пароля для вашего аккаунта RUWORK. Если это вы — нажмите кнопку "
-                           "в течение 30 минут, новый пароль заработает сразу. Если не вы — ничего не нажимайте "
-                           "и не пересылайте это сообщение.",
-                           "Да, сменить пароль", f"{tg.PUBLIC_URL}/api/auth/reset/tg/{token}")
-        else:
-            guard.alert(f"Заявка на сброс пароля: {user['name']} ({auth.shown_email(user['email']) or user['phone']}), контакт: {contact}",
-                        "#/admin/resets")
-    return {"ok": True}
+            send_reset_code(conn, user, rid)
+    return {"ok": True, "ticket": ticket}
 
 
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def reset_page(title: str, text: str) -> HTMLResponse:
-    return HTMLResponse(
-        '<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,'
-        'initial-scale=1"><title>RUWORK</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;'
-        'background:#0b0b12;color:#e8ecf4;font:16px/1.5 system-ui,sans-serif;padding:16px}div{max-width:420px;'
-        'text-align:center}a{display:inline-block;margin-top:16px;padding:12px 22px;border-radius:12px;background:#6aa9ff;'
-        f'color:#0b0b12;text-decoration:none;font-weight:600}}</style></head><body><div><h1>{html.escape(title)}</h1>'
-        f'<p>{html.escape(text)}</p><a href="/#/dashboard">Перейти на RUWORK</a></div></body></html>')
+def send_reset_code(conn: sqlite3.Connection, user, reset_id: str) -> None:
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    conn.execute("UPDATE password_resets SET code = ?, ts = ?, tries = 0 WHERE id = ?",
+                 (token_hash("reset:" + code), now_ms(), reset_id))
+    tg.send(user["tg_chat"], f"Код для восстановления пароля на RUWORK: {code}\nДействует 10 минут. Введите его на сайте "
+                             "в окне входа. Если вы не восстанавливаете пароль — никому не сообщайте код.")
 
 
-@router.get("/auth/reset/tg/{token}", include_in_schema=False)
-def confirm_reset_tg(token: str, conn: sqlite3.Connection = Depends(get_db)):
-    """Кнопка из Telegram: подтверждает ожидающую заявку на сброс пароля."""
+def reset_by_ticket(conn: sqlite3.Connection, ticket: str) -> sqlite3.Row | None:
+    r = conn.execute("SELECT r.*, u.tg_chat, u.blocked_at FROM password_resets r JOIN users u ON u.id = r.user_id"
+                     " WHERE r.token = ? AND r.status = 'pending'", (token_hash(ticket),)).fetchone() if ticket else None
+    if r is None or r["ts"] < now_ms() - RESET_CODE_TTL_MS or r["blocked_at"] is not None:
+        return None
+    return r
+
+
+class ResetCodeIn(BaseModel):
+    ticket: str
+    code: str = ""
+    password: str = ""
+    password2: str = ""
+
+
+@router.post("/auth/reset/code")
+def confirm_reset(body: ResetCodeIn, conn: sqlite3.Connection = Depends(get_db)):
+    """Восстановление пароля, шаг 2: код из Telegram-бота и новый пароль. На всех устройствах — выход."""
+    if auth.password_error(body.password) or len(body.password) > 100:
+        raise HTTPException(400, "Новый пароль: минимум 8 символов, буквы и цифры")
+    if body.password != body.password2:
+        raise HTTPException(400, "Пароли не совпадают")
+    salt, pw_hash = auth.new_password(body.password)
     with tx(conn):
-        r = conn.execute("SELECT * FROM password_resets WHERE token = ? AND status = 'pending'",
-                         (token_hash(token),)).fetchone()
-        if r is None or r["ts"] < now_ms() - RESET_TG_TTL_MS:
-            return reset_page("Ссылка недействительна", "Ссылка устарела или уже использована. "
-                                                        "Запросите смену пароля ещё раз на странице входа.")
-        conn.execute("UPDATE users SET salt = ?, hash = ? WHERE id = ?", (r["salt"], r["hash"], r["user_id"]))
+        r = reset_by_ticket(conn, body.ticket)
+        if r is not None and r["tries"] >= RESET_CODE_TRIES:
+            raise HTTPException(400, "Слишком много неверных кодов — нажмите «Отправить код ещё раз»")
+        if r is None or not secrets.compare_digest(token_hash("reset:" + body.code.strip()), r["code"] or ""):
+            if r is not None:
+                conn.execute("UPDATE password_resets SET tries = tries + 1 WHERE id = ?", (r["id"],))
+            raise HTTPException(400, "Неверный или устаревший код")
+        conn.execute("UPDATE users SET salt = ?, hash = ? WHERE id = ?", (salt, pw_hash, r["user_id"]))
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (r["user_id"],))  # выход на всех устройствах
-        conn.execute("UPDATE password_resets SET status = 'done', token = NULL WHERE id = ?", (r["id"],))
-    return reset_page("Пароль изменён", "Войдите на сайте с новым паролем. На остальных устройствах "
-                                        "выполнен выход из аккаунта.")
+        conn.execute("UPDATE password_resets SET status = 'done', token = NULL, code = NULL WHERE id = ?", (r["id"],))
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (r["user_id"],)).fetchone()
+    tg.send(user["tg_chat"], "Пароль на RUWORK изменён. Если это были не вы — срочно напишите в поддержку.")
+    if auth.is_admin(user) or auth.staff_role(user):
+        guard.alert(f"Пароль сотрудника {user['name']} изменён по коду из Telegram", "#/admin")
+    return {"ok": True}
+
+
+@router.post("/auth/reset/resend")
+def resend_reset(body: ResetCodeIn, conn: sqlite3.Connection = Depends(get_db)):
+    with tx(conn):
+        r = reset_by_ticket(conn, body.ticket)
+        if r is None:
+            return {"ok": True}  # тот же ответ, что и для настоящей заявки
+        guard.throttle("resetsend:" + r["user_id"], RESET_RESEND, "Код уже отправлен — подождите несколько минут")
+        send_reset_code(conn, r, r["id"])
+    return {"ok": True}
 
 
 @router.post("/auth/logout")

@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from .. import auth, guard
 from ..db import get_db, now_ms, tx
-from ..logic import SHARE_PROMO_MS, SHARE_COOLDOWN_MS, SHARE_VISITS, WELCOME_BONUS, audit, esc, notify
+from ..logic import SALE_FEE_PCT, SHARE_PROMO_MS, SHARE_COOLDOWN_MS, SHARE_VISITS, WELCOME_BONUS, audit, esc, notify, pct_s
 from .share import plain, share_page
 
 router = APIRouter(prefix="/api")
@@ -39,7 +39,7 @@ def invite(code: str, request: Request, conn: sqlite3.Connection = Depends(get_d
                           " только после вашего подтверждения.", "/og/site.jpg", "/")
     resp = share_page(request, f"{plain(u['name'])} приглашает вас на RUWORK",
                       f"Зарегистрируйтесь по приглашению и получите {WELCOME_BONUS} ₽ на первый заказ. "
-                      "Продавцам — неделя без комиссии.", "/og/site.jpg", f"/?inv={code.upper()}#/dashboard")
+                      f"Продавцам — неделя без комиссии, потом всего {pct_s(SALE_FEE_PCT)} %.", "/og/site.jpg", f"/?inv={code.upper()}#/dashboard")
     resp.headers["Cache-Control"] = "no-store"
     resp.set_cookie(REF_COOKIE, u["id"], max_age=REF_COOKIE_DAYS * 86400, httponly=True, samesite="lax",
                     secure=request.url.scheme == "https", path="/")

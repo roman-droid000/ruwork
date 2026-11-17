@@ -1,4 +1,5 @@
-"""Страницы для поисковиков: /uslugi, /uslugi/<категория>, /uslugi/<категория>/<подкатегория>, sitemap.xml, robots.txt.
+"""Страницы для поисковиков: /uslugi, /uslugi/<категория>, /uslugi/<категория>/<подкатегория>, sitemap.xml, robots.txt,
+а также документы: /politika, /soglashenie, /oferta и /oplata (оплата и возврат) — обычным HTML, без JavaScript.
 
 Сайт — одностраничное приложение с адресами после «#», которые Яндекс и Google не индексируют как отдельные страницы.
 Здесь сервер сам собирает обычный HTML: заголовок, описание, список объявлений со ссылками на сайт, ссылки на
@@ -12,9 +13,9 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 
-from .. import tg
+from .. import legal, tg
 from ..db import get_db
-from ..logic import CATS, SUBS, VISIBLE_SQL, rub
+from ..logic import CATS, MAX_DEP, MIN_DEP, MIN_WD, PAY_SYS_PCT, PROMO_PRICE, SALE_FEE_PCT, SUBS, VISIBLE_SQL, pct_s, rub
 
 router = APIRouter()
 
@@ -62,10 +63,22 @@ h1{font-size:clamp(26px,5vw,38px);line-height:1.15;margin:0 0 10px}h2{font-size:
 .card img,.card .ph{width:100%;aspect-ratio:300/130;object-fit:cover;background:linear-gradient(120deg,#3A1F6E,#8B5CF6)}.card .b{padding:12px 14px;display:flex;flex-direction:column;gap:6px;flex:1}
 .card b{font-weight:600}.card small{color:var(--mu)}.price{color:var(--pr);font-weight:700;margin-top:auto}.chips{display:flex;flex-wrap:wrap;gap:8px}.chips a{padding:7px 12px;border:1px solid var(--ln);background:var(--card);border-radius:99px;text-decoration:none;color:var(--tx);font-size:14px}
 .chips a.on{border-color:var(--vi);background:var(--chip)}.box{color:#fff;background:linear-gradient(120deg,#1D2B6B,#4C3BCF 60%,#8B5CF6);border-radius:16px;padding:22px;margin-top:30px}.box p{margin:6px 0 14px;opacity:.92}
-.cols{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:18px}.cols ul{margin:6px 0 0;padding-left:18px}footer{margin-top:40px;color:var(--mu);font-size:14px}"""
+.cols{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:18px}.cols ul{margin:6px 0 0;padding-left:18px}footer{margin-top:40px;color:var(--mu);font-size:14px;line-height:1.7}
+.doc{max-width:820px}.doc h2{font-size:20px;margin:26px 0 8px}.doc p,.doc li{margin:6px 0}.doc ul{padding-left:22px}"""
 
 
-def page(title: str, desc: str, path: str, crumbs: list[tuple[str, str]], body: str) -> HTMLResponse:
+PROMO = """<div class="box"><b style="font-size:20px">Не нашли подходящую услугу?</b><p>Опишите задачу на бирже заданий — продавцы сами предложат цену и срок. Оплата через безопасную сделку: деньги продавец получит только после вашего подтверждения.</p><a class="btn" style="background:#fff;color:#1E1B2E" href="/?req=1#/requests">Разместить задание</a></div>
+<div class="box" style="background:linear-gradient(120deg,#123F2E,#1F7A5A 55%,#4CC38A)"><b style="font-size:20px">Вы фрилансер?</b><p>Разместите услугу на RUWORK за 5 минут. Комиссия — всего {FEE} %, а первая неделя с первого заказа — без комиссии.</p><a class="btn" style="background:#fff;color:#1E1B2E" href="/#/dashboard/gigs">Стать продавцом</a></div>""".replace("{FEE}", pct_s(SALE_FEE_PCT))
+
+FOOTER = (f'<footer><a href="/uslugi">Все услуги</a> · <a href="/#/help">Как проходит сделка</a> · <a href="/#/support">Поддержка</a>'
+          f' · <a href="/oplata">Оплата и возврат</a> · <a href="/soglashenie">Пользовательское соглашение</a>'
+          f' · <a href="/oferta">Публичная оферта</a> · <a href="/politika">Политика конфиденциальности</a>'
+          f'<br>{e(legal.REQUISITES)} · <a href="tel:{legal.PHONE_HREF}">{e(legal.PHONE)}</a>'
+          f' · <a href="mailto:{legal.EMAIL}">{legal.EMAIL}</a>'
+          f' · Telegram: <a href="https://t.me/{legal.SUPPORT_TG}">@{legal.SUPPORT_TG}</a></footer>')
+
+
+def page(title: str, desc: str, path: str, crumbs: list[tuple[str, str]], body: str, promo: bool = True) -> HTMLResponse:
     ld = {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": [
         {"@type": "ListItem", "position": i + 1, "name": n, "item": SITE + u} for i, (n, u) in enumerate(crumbs)]}
     cr = " › ".join(f'<a href="{e(u)}">{e(n)}</a>' for n, u in crumbs[:-1]) + (f" › {e(crumbs[-1][0])}" if crumbs else "")
@@ -77,9 +90,8 @@ def page(title: str, desc: str, path: str, crumbs: list[tuple[str, str]], body: 
 <script type="application/ld+json">{json.dumps(ld, ensure_ascii=False).replace("<", "\\u003c")}</script></head><body><main>
 <header><a class="logo" href="/">RUWORK</a><nav><a class="btn o" href="/#/catalog">Каталог услуг</a></nav></header>
 <div class="crumbs">{cr}</div>{body}
-<div class="box"><b style="font-size:20px">Не нашли подходящую услугу?</b><p>Опишите задачу на бирже заданий — продавцы сами предложат цену и срок. Оплата через безопасную сделку: деньги продавец получит только после вашего подтверждения.</p><a class="btn" style="background:#fff;color:#1E1B2E" href="/?req=1#/requests">Разместить задание</a></div>
-<div class="box" style="background:linear-gradient(120deg,#123F2E,#1F7A5A 55%,#4CC38A)"><b style="font-size:20px">Вы фрилансер?</b><p>Разместите услугу на RUWORK за 5 минут. Первая неделя — без комиссии с продаж.</p><a class="btn" style="background:#fff;color:#1E1B2E" href="/#/dashboard/gigs">Стать продавцом</a></div>
-<footer><a href="/uslugi">Все услуги</a> · <a href="/#/help">Как проходит сделка</a> · <a href="/#/pay">Оплата и возврат</a> · <a href="/#/offer">Публичная оферта</a> · <a href="/#/support">Поддержка</a> · RUWORK — маркетплейс фриланс-услуг<br>Аминджанов Роман Темурович · ИНН 780115946203 · г. Санкт-Петербург · <a href="tel:+79312276736">+7 931 227-67-36</a> · <a href="mailto:phantom.crypta@mail.ru">phantom.crypta@mail.ru</a></footer>
+{PROMO if promo else ""}
+{FOOTER}
 </main></body></html>"""
     return HTMLResponse(out, headers={"Cache-Control": "public, max-age=600"})
 
@@ -154,7 +166,7 @@ def subcategory(cat: str, sub_slug: str, conn: sqlite3.Connection = Depends(get_
 
 @router.get("/sitemap.xml", include_in_schema=False)
 def sitemap():
-    urls = ["/", "/uslugi"] + [f"/uslugi/{c}" for c in CATS] + [f"/uslugi/{c}/{s}" for c, s in SUB_BY_SLUG]
+    urls = ["/", "/uslugi", "/oplata", "/oferta", "/soglashenie", "/politika"] + [f"/uslugi/{c}" for c in CATS] + [f"/uslugi/{c}/{s}" for c, s in SUB_BY_SLUG]
     body = "".join(f"<url><loc>{e(SITE + u)}</loc></url>" for u in urls)
     return Response(f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
                     f"{body}</urlset>", media_type="application/xml", headers={"Cache-Control": "public, max-age=3600"})
@@ -164,3 +176,89 @@ def sitemap():
 def robots():
     return PlainTextResponse(f"User-agent: *\nDisallow: /api/\nDisallow: /media/\nAllow: /media/thumb/\n"
                              f"Sitemap: {SITE}/sitemap.xml\n")
+
+
+# ---------- Документы и оплата ----------
+
+def doc_body(d: dict) -> str:
+    secs = "".join(f"<h2>{e(h)}</h2>{body}" for h, body in d["s"])
+    return f'<article class="doc"><h1>{e(d["t"])}</h1><p class="lead">Редакция от {e(d["d"])}</p>{secs}</article>'
+
+
+def legal_page(slug: str):
+    _, d = legal.BY_SLUG[slug]
+    return page(f"{d['t']} | RUWORK", f"{d['t']} сервиса RUWORK (ruwork.shop).", f"/{slug}",
+                [("RUWORK", "/"), (d["t"], f"/{slug}")], doc_body(d), promo=False)
+
+
+@router.get("/politika", include_in_schema=False)
+def politika():
+    return legal_page("politika")
+
+
+@router.get("/soglashenie", include_in_schema=False)
+def soglashenie():
+    return legal_page("soglashenie")
+
+
+@router.get("/oferta", include_in_schema=False)
+def oferta():
+    return legal_page("oferta")
+
+
+@router.get("/api/legal/{key}", include_in_schema=False)
+def legal_json(key: str):
+    if key not in legal.DOCS:
+        raise HTTPException(404, "Документ не найден")
+    return legal.as_json(key)
+
+
+def n(x: int) -> str:
+    return f"{x:,}".replace(",", " ")
+
+
+@router.get("/oplata", include_in_schema=False)
+def oplata():
+    box = lambda h, b: f'<section class="doc"><h2>{h}</h2>{b}</section>'  # noqa: E731
+    body = (
+        '<h1>Оплата и возврат</h1><p class="lead">Что оплачивается на RUWORK, как зачисляются деньги, как получить услугу'
+        ' и вернуть оплату.</p>'
+        + box("Что вы оплачиваете",
+              f"<p>На RUWORK оплачивается <b>пополнение баланса</b> — на любую сумму от {n(MIN_DEP)} до {n(MAX_DEP)} ₽."
+              " Баланс ведётся в монетах: 1 монета = 1 ₽, сколько оплатили — столько монет и зачислится. С баланса оплачиваются:</p>"
+              "<ul><li><b>заказы услуг у продавцов</b> — цена указана в объявлении (тарифы «Базовый», «Стандарт», «Премиум»)"
+              " или в отклике на задание;</li>"
+              f"<li><b>продвижение объявления</b> — {PROMO_PRICE} ₽ за 7 дней показа в начале каталога.</li></ul>")
+        + box("Как оплатить",
+              "<p>Войдите или зарегистрируйтесь, откройте «Кошелёк» в личном кабинете, введите сумму и выберите способ:"
+              " <b>СБП</b> или <b>банковская карта</b> (Visa, Mastercard, МИР). Оплата проходит на защищённой странице"
+              " платёжного сервиса Robokassa; данные карты RUWORK не получает.</p>")
+        + box("Получение",
+              "<p>Монеты зачисляются на баланс сразу после подтверждения платежа платёжным сервисом. Физической доставки нет:"
+              " всё происходит на сайте.</p><p>Услуги продавцов оказываются через безопасную сделку: продавец загружает"
+              " результат на страницу заказа в срок, указанный в тарифе, а оплату получает только после того, как вы подтвердите"
+              ' получение. <a href="/#/help">Как проходит сделка</a>.</p><p>Продвижение объявления начинается сразу после'
+              " оплаты и длится 7 дней.</p>")
+        + box("Отмена заказа и возврат",
+              "<ul><li>В первую минуту после оплаты заказ можно отменить самому — 100 % вернётся на баланс.</li>"
+              "<li>Заказ «В работе» отменяется по согласию продавца — 100 % на баланс. Если продавец отказал или не ответил"
+              " за 2 суток — откройте спор: администратор решит, вернуть оплату, перевести её продавцу или поделить.</li>"
+              "<li>Если продавец просрочил срок сдачи — отмените заказ сами, 100 % на баланс.</li>"
+              "<li>Не устроил результат — запросите доработку или откройте спор.</li>"
+              "<li><b>Неистраченное пополнение возвращается</b> по заявке: «Кошелёк» → «Вернуть на карту». Деньги придут тем же"
+              " способом, которым вы платили (карта или СБП); сроки зачисления зависят от банка.</li>"
+              "<li>Стоимость продвижения после начала показа не возвращается.</li></ul>")
+        + box("Для продавцов",
+              f"<p>Комиссия с продажи: {e(legal.FEES)}. Из неё {pct_s(PAY_SYS_PCT)} % — комиссия платёжной системы, остальное — доля платформы или пригласившего вас пользователя; в первую неделю платёжную систему оплачивает платформа. Ставка фиксируется в момент оплаты заказа. Заработок выводится через СБП"
+              f" от {n(MIN_WD)} монет, комиссия за вывод 5 %. Налоги с дохода продавец платит сам — см. раздел 17"
+              ' <a href="/soglashenie">соглашения</a>.</p>')
+        + box("Документы и продавец",
+              '<p><a href="/oferta">Публичная оферта</a> · <a href="/soglashenie">Пользовательское соглашение</a>'
+              ' (разделы 13–15) · <a href="/politika">Политика конфиденциальности</a></p>'
+              f"<p>{e(legal.REQUISITES)}<br>Телефон: <a href=\"tel:{legal.PHONE_HREF}\">{e(legal.PHONE)}</a><br>"
+              f'E-mail: <a href="mailto:{legal.EMAIL}">{legal.EMAIL}</a><br>'
+              f'Telegram: <a href="https://t.me/{legal.SUPPORT_TG}">@{legal.SUPPORT_TG}</a></p>')
+    )
+    return page("Оплата и возврат | RUWORK", f"Как оплатить на RUWORK: пополнение баланса от {n(MIN_DEP)} ₽ через СБП или"
+                " карту, получение услуг, отмена заказа и возврат денег.", "/oplata",
+                [("RUWORK", "/"), ("Оплата и возврат", "/oplata")], body, promo=False)

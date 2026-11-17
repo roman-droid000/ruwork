@@ -135,7 +135,8 @@ RESETS_SQL = (
 
 @router.get("/resets", dependencies=admin_only)
 def resets(conn: sqlite3.Connection = Depends(get_db)):
-    pending = conn.execute(RESETS_SQL + " WHERE r.status = 'pending' ORDER BY r.ts").fetchall()
+    # Заявки с кодом из Telegram пользователь подтверждает сам — администратору только заявки без Telegram.
+    pending = conn.execute(RESETS_SQL + " WHERE r.status = 'pending' AND r.token IS NULL ORDER BY r.ts").fetchall()
     done = conn.execute(RESETS_SQL + " WHERE r.status != 'pending' ORDER BY r.ts DESC LIMIT 50").fetchall()
     return [dict(r) for r in pending + done]
 
@@ -343,7 +344,7 @@ def hide_gig(gig_id: str, body: HideIn, staff=Depends(auth.require_staff), conn:
 # ---------- Споры ----------
 
 DISPUTES_SQL = DEALS_SQL.replace(
-    "SELECT o.id,", "SELECT o.dispute_at, o.dispute_reason, o.dispute_result, o.confirmed_at, o.id,", 1
+    "SELECT o.id,", "SELECT o.dispute_at, o.dispute_reason, o.cancel_reason, o.cancel_req_at, o.dispute_result, o.confirmed_at, o.id,", 1
 ) + " WHERE o.dispute_at IS NOT NULL"
 
 

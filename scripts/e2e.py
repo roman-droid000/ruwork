@@ -184,17 +184,23 @@ def run(base: str, db: Path, tmp: Path) -> None:
     seller.ok("POST", f"/api/chat/{gig['id']}/reply", {"to": me_b["id"], "text": "Добрый день, всё обсудим здесь."})
 
     step("5. Пополнение баланса покупателя")
-    code, _ = buyer.call("POST", "/api/wallet/deposit", {"amount": 10001})
-    check("пополнение больше 10 000 отклоняется", code == 400)
-    code, _ = buyer.call("POST", "/api/wallet/deposit", {"amount": 1500})
-    check("пополнение только на суммы из списка: 1 500 — нельзя", code == 400 and 1500 not in meta["dep_amounts"], meta.get("dep_amounts"))
-    dep_sum = 5000  # есть в списке сумм пополнения; хватает на все заказы теста
+    code, _ = buyer.call("POST", "/api/wallet/deposit", {"amount": meta["dep_max"] + 1})
+    check("пополнение больше максимума отклоняется", code == 400)
+    code, _ = buyer.call("POST", "/api/wallet/deposit", {"amount": 99})
+    check("пополнение меньше 100 отклоняется", code == 400 and meta["dep_min"] == 100, meta.get("dep_min"))
+    dep_sum = 5037  # любая целая сумма в пределах; хватает на все заказы теста
     buyer.ok("POST", "/api/wallet/deposit", {"amount": dep_sum})
     dep = next(o for o in admin.ok("GET", "/api/admin/ops") if o["status"] == "pending" and o["t"] == "dep")
     admin.ok("POST", f"/api/admin/ops/{dep['id']}/approve")
     check("баланс пополнен", buyer.ok("GET", "/api/state")["wallet"]["coins"] == dep_sum)
-    code, err = buyer.call("POST", "/api/wallet/refund", {"amount": 100})
-    check("возврат на карту отключён — монеты остаются на балансе", code == 400 and "не производится" in str(err), err)
+    code, _ = buyer.call("POST", "/api/wallet/refund", {"amount": dep_sum + 1})
+    check("вернуть на карту больше пополнения нельзя", code == 400)
+    buyer.ok("POST", "/api/wallet/refund", {"amount": 100})
+    rf = next(o for o in admin.ok("GET", "/api/admin/ops") if o["status"] == "pending" and o["t"] == "rf")
+    check("заявка на возврат пополнения создана, монеты удержаны",
+          rf["coins"] == 100 and buyer.ok("GET", "/api/state")["wallet"]["coins"] == dep_sum - 100, rf)
+    admin.ok("POST", f"/api/admin/ops/{rf['id']}/reject")
+    check("отклонённый возврат вернул монеты", buyer.ok("GET", "/api/state")["wallet"]["coins"] == dep_sum)
 
     step("6. Заказ → результат → доработка → подтверждение")
     code, err = buyer.call("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "sbp"})
@@ -233,6 +239,39 @@ def run(base: str, db: Path, tmp: Path) -> None:
     check("комиссия за вывод 5 %: с 500 монет — 25", wd["fee"] == 25, wd)
     admin.ok("POST", f"/api/admin/ops/{wd['id']}/approve")
     check("вывод одобрен", seller.ok("GET", "/api/state")["wallet"]["earned"] == net - 500)
+
+    step("8a. Отмена заказа «В работе»: по согласию продавца или при просрочке")
+
+    def new_work_order() -> str:
+        buyer.ok("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
+        o = buyer.ok("GET", "/api/state")["orders"][0][5]
+        sql("UPDATE orders SET created_at = created_at - 61000 WHERE id = ?", o)
+        buyer.ok("GET", "/api/state")
+        return o
+
+    oc = new_work_order()
+    c0 = buyer.ok("GET", "/api/state")["wallet"]["coins"]
+    r = buyer.ok("POST", f"/api/orders/{oc}/cancel", {"reason": "Задача больше не актуальна"})
+    check("отмена «В работе» в срок — только запрос продавцу", r.get("requested") and buyer.ok("GET", f"/api/orders/{oc}")["status"] == "В работе", r)
+    code, _ = buyer.call("POST", f"/api/orders/{oc}/cancel")
+    check("второй запрос на отмену не создаётся", code == 400)
+    sd = seller.ok("GET", f"/api/orders/{oc}")
+    check("продавец видит запрос и причину", sd["cancel_req_at"] and sd["cancel_reason"] == "Задача больше не актуальна", sd)
+    code, _ = buyer.call("POST", f"/api/orders/{oc}/cancel/accept")
+    check("покупатель не может сам принять свой запрос", code == 400)
+    seller.ok("POST", f"/api/orders/{oc}/cancel/decline")
+    check("продавец отклонил — заказ в работе, запрос снят",
+          buyer.ok("GET", f"/api/orders/{oc}")["status"] == "В работе" and not buyer.ok("GET", f"/api/orders/{oc}")["cancel_req_at"])
+    buyer.ok("POST", f"/api/orders/{oc}/cancel", {"reason": "Всё-таки отменяю"})
+    seller.ok("POST", f"/api/orders/{oc}/cancel/accept")
+    check("продавец согласился — заказ отменён, покупателю 100 %",
+          buyer.ok("GET", f"/api/orders/{oc}")["status"] == "Отменён" and buyer.ok("GET", "/api/state")["wallet"]["coins"] == c0 + price)
+    ol = new_work_order()
+    c1 = buyer.ok("GET", "/api/state")["wallet"]["coins"]
+    sql("UPDATE orders SET started_at = started_at - (days + 1) * 86400000 WHERE id = ?", ol)
+    r = buyer.ok("POST", f"/api/orders/{ol}/cancel")
+    check("срок сдачи прошёл — покупатель отменяет сам со 100 %",
+          r.get("refund") == price and buyer.ok("GET", "/api/state")["wallet"]["coins"] == c1 + price, r)
 
     step("8. Спор и решение администратора")
     buyer.ok("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
@@ -324,8 +363,8 @@ def run(base: str, db: Path, tmp: Path) -> None:
     check("бонусом нельзя оплатить заказ у связанного аккаунта", code == 400)
     pk = seller.ok("GET", "/api/state")["perks"]
     check("первая неделя: комиссия 0 %", pk["fee_now"] == 0 and pk["fee_free_until"], pk)
-    # Продавца пригласил inviter. Продажа на 2-й неделе: комиссия 9 % — платёжной системе 8,5 %, пригласившему 0,5 %,
-    # платформе 0; после 3 недель: комиссия 11,5 % — платёжной системе 8,5 %, пригласившему 3 % (без пригласившего — платформе).
+    # Продавца пригласил inviter. Продажа на 2-й неделе: комиссия 3,5 % — платёжной системе 3 %, пригласившему 0,5 %,
+    # платформе 0; после 3 недель: комиссия 6 % — платёжной системе 3 %, пригласившему 3 % (без пригласившего — платформе).
     buyer.ok("POST", "/api/wallet/deposit", {"amount": price * 5})
     dep2 = next(o for o in admin.ok("GET", "/api/admin/ops") if o["status"] == "pending" and o["t"] == "dep")
     admin.ok("POST", f"/api/admin/ops/{dep2['id']}/approve")
@@ -333,7 +372,8 @@ def run(base: str, db: Path, tmp: Path) -> None:
 
     def sale_at(days: int) -> tuple[int, int, int, int]:
         """Продажа на `price`, когда продавцу `days` дней: (+продавцу, +пригласившему, +платёжной системе, +платформе)."""
-        sql("UPDATE users SET created_at = created_at - ? WHERE id = ?", days * 86400000, me_s["id"])
+        # Льготные недели считаются с первого оплаченного продавцу заказа: сдвигаем его заказы в прошлое.
+        sql("UPDATE orders SET created_at = created_at - ? WHERE seller_id = ?", days * 86400000, me_s["id"])
         s0, r0 = seller.ok("GET", "/api/state")["wallet"]["earned"], inviter.ok("GET", "/api/state")["wallet"]["earned"]
         pl0 = admin.ok("GET", "/api/admin/platform")
         buyer.ok("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
@@ -346,33 +386,52 @@ def run(base: str, db: Path, tmp: Path) -> None:
         out = (seller.ok("GET", "/api/state")["wallet"]["earned"] - s0, inviter.ok("GET", "/api/state")["wallet"]["earned"] - r0,
                admin.ok("GET", "/api/admin/platform")["pay_sys"] - pl0["pay_sys"],
                admin.ok("GET", "/api/admin/platform")["coins"] - pl0["coins"])
-        sql("UPDATE users SET created_at = created_at + ? WHERE id = ?", days * 86400000, me_s["id"])  # продавец снова новый
+        sql("UPDATE orders SET created_at = created_at + ? WHERE seller_id = ? AND id != ?", days * 86400000, me_s["id"], o)
         return out
 
     got = sale_at(0)
-    pay = price * 85 // 1000  # 8,5 %
-    check(f"первая неделя: продавцу 100 %, платёжной системе 8,5 % — доплачивает платформа — {got}",
+    pay = price * 3 // 100  # 3 %
+    check(f"первая неделя: продавцу 100 %, платёжной системе 3 % — доплачивает платформа — {got}",
           got == (price, 0, pay, -pay))
-    sql("UPDATE users SET created_at = created_at - 10 * 86400000 WHERE id = ?", me_s["id"])
+    sql("UPDATE orders SET created_at = created_at - 10 * 86400000 WHERE seller_id = ?", me_s["id"])
     pk = seller.ok("GET", "/api/state")["perks"]
-    check("2-я неделя после регистрации: комиссия 9 %", pk["fee_now"] == 9 and pk["fee_free_until"] is None and pk["fee_low_until"], pk)
-    sql("UPDATE users SET created_at = created_at + 10 * 86400000 WHERE id = ?", me_s["id"])
+    check("2-я неделя с первого заказа: комиссия 3,5 %", pk["fee_now"] == 3.5 and pk["fee_free_until"] is None and pk["fee_low_until"], pk)
+    sql("UPDATE orders SET created_at = created_at + 10 * 86400000 WHERE seller_id = ?", me_s["id"])
+    sql("UPDATE users SET created_at = created_at - 30 * 86400000 WHERE id = ?", inv_id)
+    pk = inviter.ok("GET", "/api/state")["perks"]
+    check("без заказов неделя 0 % не сгорает, даже через месяц после регистрации",
+          pk["fee_now"] == 0 and not pk["fee_started"] and pk["fee_free_until"] is None, pk)
+    sql("UPDATE users SET created_at = created_at + 30 * 86400000 WHERE id = ?", inv_id)
+    # Ставка фиксируется при оплате: заказ оплачен в неделю 0 %, а подтверждён через 22 дня — комиссии нет.
+    of = None
+    buyer.ok("POST", "/api/orders", {"items": [{"id": gig["id"], "tier": 0}], "method": "bal"})
+    of = buyer.ok("GET", "/api/state")["orders"][0][5]
+    sql("UPDATE orders SET created_at = created_at - 61000 WHERE id = ?", of)
+    buyer.ok("GET", "/api/state")
+    sql("UPDATE orders SET created_at = created_at - 22 * 86400000 WHERE seller_id = ? AND id != ?", me_s["id"], of)
+    s0 = seller.ok("GET", "/api/state")["wallet"]["earned"]
+    f = seller.ok("POST", f"/api/orders/{of}/files", {"name": "r.txt", "size": 3, "mime": "text/plain"})
+    seller.ok("PUT", f"/api/orders/{of}/files/{f['id']}?offset=0", raw=b"r v", ctype="application/octet-stream")
+    buyer.ok("POST", f"/api/orders/{of}/confirm")
+    check("ставка заказа фиксируется при оплате: 0 % сохраняется до подтверждения",
+          seller.ok("GET", "/api/state")["wallet"]["earned"] - s0 == price)
+    sql("UPDATE orders SET created_at = created_at + 22 * 86400000 WHERE seller_id = ? AND id != ?", me_s["id"], of)
     got = sale_at(10)
-    check(f"2-я неделя: продавцу 91 %, платёжной системе 8,5 %, пригласившему 0,5 %, платформе 0 — {got}",
-          got == (price * 91 // 100, price * 5 // 1000, pay, 0))
+    check(f"2-я неделя: продавцу 96,5 %, платёжной системе 3 %, пригласившему 0,5 %, платформе 0 — {got}",
+          got == (price - price * 35 // 1000, price * 5 // 1000, pay, 0))
     got = sale_at(22)
     fee = -(-price * meta["sale_fee_pct"] // 100)
-    check(f"после 3 недель: продавцу 88,5 %, платёжной системе 8,5 %, пригласившему 3 %, платформе 0 — {got}",
-          got == (price - price * 115 // 1000, price * 3 // 100, pay, 0) and fee == price * 115 // 1000)
+    check(f"после 3 недель: продавцу 94 %, платёжной системе 3 %, пригласившему 3 %, платформе 0 — {got}",
+          got == (price - price * 6 // 100, price * 3 // 100, pay, 0) and fee == price * 6 // 100)
     check("реферальный заработок виден в профиле пригласившего",
           inviter.ok("GET", "/api/state")["perks"]["ref"]["earned"] == price * 5 // 1000 + price * 3 // 100)
     sql("UPDATE users SET ref_by = NULL WHERE id = ?", me_s["id"])
     got = sale_at(22)
-    check(f"без пригласившего после 3 недель: продавцу 88,5 %, платёжной системе 8,5 %, платформе 3 % — {got}",
-          got == (price - price * 115 // 1000, 0, pay, price * 3 // 100))
+    check(f"без пригласившего после 3 недель: продавцу 94 %, платёжной системе 3 %, платформе 3 % — {got}",
+          got == (price - price * 6 // 100, 0, pay, price * 3 // 100))
     got = sale_at(10)
-    check(f"без пригласившего на 2-й неделе: продавцу 91 %, платёжной системе 8,5 %, платформе 0,5 % — {got}",
-          got == (price * 91 // 100, 0, pay, price * 5 // 1000))
+    check(f"без пригласившего на 2-й неделе: продавцу 96,5 %, платёжной системе 3 %, платформе 0,5 % — {got}",
+          got == (price - price * 35 // 1000, 0, pay, price * 5 // 1000))
     sql("UPDATE users SET ref_by = ? WHERE id = ?", inv_id, me_s["id"])
 
     code, _ = seller.call("POST", "/api/me/ext", {"url": "https://example.com/me", "rating": 4.9, "reviews": 10})
@@ -422,10 +481,16 @@ def run(base: str, db: Path, tmp: Path) -> None:
     check("после 10 неверных паролей — 429", codes[:10] == [400] * 10 and codes[10] == 429, codes)
     code, _ = Client(base, "10.0.0.98").call("POST", "/api/auth/login", {"email": me_s["email"], "password": pw})
     check("перебор блокирует вход в аккаунт и с другого адреса", code == 429, code)
-    code, _ = buyer.call("POST", "/api/auth/reset", {"email": me_b["email"], "password": "NewPassw0rd", "password2": "NewPassw0rd",
-                                                     "contact": "@buyer"})
-    check("заявка на сброс пароля принята", code == 200, code)
-    check("заявка видна администратору", any(r["status"] == "pending" for r in admin.ok("GET", "/api/admin/resets")))
+    code, _ = buyer.call("POST", "/api/auth/reset", {"phone": me_b["email"]})
+    check("восстановление только по телефону: email отклонён", code == 400)
+    code, rb = buyer.call("POST", "/api/auth/reset", {"phone": "+7 900 111-22-33"})
+    code2, rn = buyer.call("POST", "/api/auth/reset", {"phone": "8 900 999-88-77"})
+    check("восстановление: одинаковый ответ с билетом, есть аккаунт или нет",
+          code == code2 == 200 and rb.get("ticket") and rn.get("ticket") and rb.keys() == rn.keys(), (rb, rn))
+    check("без Telegram заявка администратору не создаётся", not any(r["status"] == "pending" for r in admin.ok("GET", "/api/admin/resets")))
+    code, _ = buyer.call("POST", "/api/auth/reset/code", {"ticket": rb["ticket"], "code": "123456",
+                                                          "password": "NewPassw0rd", "password2": "NewPassw0rd"})
+    check("без Telegram код не подходит", code == 400)
 
     step("12. Страницы")
     for path in ("/", "/manifest.json", f"/g/{gig['id']}", f"/s/{me_s['id']}"):
@@ -672,9 +737,33 @@ def run_mfa(base: str, db: Path, tmp: Path) -> None:
     bot(7002, contact={"phone_number": "+7 900 555-44-33", "user_id": 7002})
     row = c.execute("SELECT code FROM tg_regs WHERE token = ?", (reg_hash(t2),)).fetchone()
     check("второй аккаунт на тот же номер не завести", row == (None,), row)
-    code, _ = new.call("POST", "/api/auth/reset", {"email": "+79005554433", "password": "NewPassw0rd1",
-                                                   "password2": "NewPassw0rd1", "contact": "@tg_user"})
-    check("сброс пароля по телефону принят", code == 200, code)
+    uid_n, salt_n, hash_n = c.execute("SELECT id, salt, hash FROM users WHERE phone = '+79005554433'").fetchone()
+    sess_n = c.execute("SELECT * FROM sessions WHERE user_id = ?", (uid_n,)).fetchall()
+    code, rr = new.call("POST", "/api/auth/reset", {"phone": "8 (900) 555-44-33"})
+    check("сброс пароля по телефону принят, выдан билет", code == 200 and rr.get("ticket"), rr)
+    row = c.execute("SELECT r.code, r.token FROM password_resets r JOIN users u ON u.id = r.user_id"
+                    " WHERE u.phone = '+79005554433' AND r.status = 'pending'").fetchone()
+    check("бот прислал код: заявка с кодом, администратору не показывается",
+          row and row[0] and row[1] and not any(x["status"] == "pending" for x in admin.ok("GET", "/api/admin/resets")), row)
+    c.execute("UPDATE password_resets SET code = ? WHERE token = ?",
+              (hashlib.sha256(b"reset:246810").hexdigest(), row[1]))
+    c.commit()
+    code, err = new.call("POST", "/api/auth/reset/code", {"ticket": rr["ticket"], "code": "000000", "password": "NewPassw0rd1", "password2": "NewPassw0rd1"})
+    check("неверный код сброса отклонён", code == 400, err)
+    code, err = new.call("POST", "/api/auth/reset/code", {"ticket": "чужой-билет", "code": "246810", "password": "NewPassw0rd1", "password2": "NewPassw0rd1"})
+    check("код не подходит к чужому билету", code == 400, err)
+    code, err = new.call("POST", "/api/auth/reset/code", {"ticket": rr["ticket"], "code": "246810", "password": "short", "password2": "short"})
+    check("слабый новый пароль отклонён до проверки кода", code == 400 and "8 символов" in str(err), err)
+    new.ok("POST", "/api/auth/reset/code", {"ticket": rr["ticket"], "code": "246810", "password": "NewPassw0rd1", "password2": "NewPassw0rd1"})
+    code, r2 = Client(base, "10.0.0.77").call("POST", "/api/auth/login", {"email": "+79005554433", "password": "NewPassw0rd1"})
+    check("после кода из бота вход с новым паролем", code == 200 and (r2.get("need_code") or r2.get("me")), (code, r2))
+    code, _ = new.call("POST", "/api/auth/reset/code", {"ticket": rr["ticket"], "code": "246810", "password": "NewPassw0rd1", "password2": "NewPassw0rd1"})
+    check("код сброса одноразовый", code == 400)
+    # Дальше тест удаляет этот аккаунт со старым паролем: возвращаем пароль и сессии, которые сброс завершил.
+    c.execute("UPDATE users SET salt = ?, hash = ? WHERE id = ?", (salt_n, hash_n, uid_n))
+    for srow in sess_n:
+        c.execute(f"INSERT OR REPLACE INTO sessions VALUES ({','.join('?' * len(srow))})", srow)
+    c.commit()
 
     step("21. Удаление аккаунта с кодом из Telegram")
     check("для удаления нужен код из Telegram", new.ok("GET", "/api/me/delete")["tg"] is True)
@@ -771,8 +860,8 @@ def run_pay(base: str, db: Path, tmp: Path) -> None:
     code, text = nobody.call("POST", "/api/pay/robokassa/result", raw=rk("300.00", inv + 1), ctype=form)
     check("оплата, пришедшая после отмены, всё равно зачисляется", text == f"OK{inv + 1}"
           and u.ok("GET", "/api/state")["wallet"]["coins"] == 800, (code, text))
-    code, _ = u.call("POST", "/api/wallet/deposit", {"amount": 1500, "method": "card"})
-    check("и через шлюз — только суммы из списка", code == 400, code)
+    code, _ = u.call("POST", "/api/wallet/deposit", {"amount": 99, "method": "card"})
+    check("и через шлюз — не меньше 100", code == 400, code)
     check("сверка после пополнений через шлюз — без расхождений", admin.ok("GET", "/api/admin/reconcile")["bad"] == [])
 
 

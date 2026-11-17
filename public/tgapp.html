@@ -361,7 +361,9 @@ function orderHint(d) {
   const buy = role(d) === "buy";
   switch (d.status) {
     case "Ожидает подтверждения": return "Оплата получена — через минуту заказ перейдёт в работу. Сейчас отмена вернёт 100 %.";
-    case "В работе": return buy ? "Продавец выполняет заказ. Отмена сейчас вернёт 90 % суммы." : "Загрузите результат на сайте — покупатель получит уведомление.";
+    case "В работе": return d.cancel_req_at
+      ? (buy ? "Запрос на отмену отправлен продавцу. Если он откажет или не ответит за 2 суток — откройте спор." : "Покупатель просит отменить заказ. Если согласитесь, ему вернётся вся оплата.")
+      : (buy ? (d.cancel_now ? "Срок сдачи прошёл — заказ можно отменить с возвратом 100 %." : "Продавец выполняет заказ. Отменить его можно по согласию продавца или через спор.") : "Загрузите результат на сайте — покупатель получит уведомление.");
     case "На проверке": return buy ? "Проверьте результат и подтвердите получение — или откройте спор, если что-то не так." : "Ждём подтверждения покупателя.";
     case "Спор": return "Оплата заморожена, решение примет администратор.";
     case "Выполнен": return buy ? "Заказ завершён." : "Оплата зачислена на баланс.";
@@ -374,7 +376,8 @@ function orderView() {
   const d = S.order, buy = role(d) === "buy", s = d.status;
   const chatN = d.chat.filter(m => m.r !== "order").length;
   const acts = [];
-  if (buy && (s === "Ожидает подтверждения" || s === "В работе")) acts.push(`<button class="btn danger" data-act="cancel">Отменить заказ</button>`);
+  if (buy && (s === "Ожидает подтверждения" || s === "В работе") && !d.cancel_req_at) acts.push(`<button class="btn danger" data-act="cancel">${d.cancel_now ? "Отменить заказ" : "Попросить отменить"}</button>`);
+  if (!buy && s === "В работе" && d.cancel_req_at) acts.push(`<button class="btn" data-act="cancel-accept">Согласиться на отмену</button>`, `<button class="btn danger" data-act="cancel-decline">Отклонить отмену</button>`);
   if (buy && d.has_seller && (s === "В работе" || s === "На проверке")) acts.push(`<button class="btn danger" data-act="dispute">Открыть спор</button>`);
   if (buy && s === "Спор") acts.push(`<button class="btn" data-act="dispute-close">Закрыть спор</button>`);
   if (!buy && s === "В работе") acts.push(`<button class="btn main full" data-link="/#/order/${esc(d.id)}">Загрузить результат на сайте</button>`);
@@ -516,9 +519,11 @@ document.addEventListener("click", async e => {
   else if (a === "review") sendReview();
   else if (a === "support") { tg.openTelegramLink(`https://t.me/${encodeURIComponent(S.data.bot || "ruworksupport_bot")}?start=order_${encodeURIComponent(S.order.id)}`); tg.close() }
   else if (a === "cancel") {
-    const refund = S.order.status === "Ожидает подтверждения" ? "100 %" : "90 %";
-    if (await ask(`Отменить заказ ${S.order.num}? На баланс вернётся ${refund} суммы.`)) act("cancel", null, "Заказ отменён");
+    if (S.order.cancel_now) { if (await ask(`Отменить заказ ${S.order.num}? На баланс вернётся 100 % суммы.`)) act("cancel", null, "Заказ отменён") }
+    else if (await ask(`Заказ уже в работе: отправить продавцу запрос на отмену ${S.order.num}? Если он согласится, вернётся 100 %.`)) act("cancel", null, "Запрос отправлен продавцу");
   }
+  else if (a === "cancel-accept") { if (await ask("Отменить заказ? Покупателю вернётся вся оплата.")) act("cancel-accept", null, "Заказ отменён") }
+  else if (a === "cancel-decline") { if (await ask("Отклонить запрос? Покупатель сможет открыть спор.")) act("cancel-decline", null, "Запрос отклонён") }
   else if (a === "dispute-close") { if (await ask("Закрыть спор? Заказ вернётся к проверке результата.")) act("dispute-close", null, "Спор закрыт") }
   else if (a === "home") addHome();
   else if (a === "home-hide") { S.homeHidden = true; cloudSet("home_hidden", "1"); render() }
